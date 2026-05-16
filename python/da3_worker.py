@@ -287,7 +287,15 @@ def resized_input_for(image_path: Path, options: dict[str, Any], temp_dir: Path)
         return output_path
 
 
-def save_depth(depth: Any, output_path: Path, output_format: str, invert: bool) -> None:
+def save_depth(
+    depth: Any,
+    output_path: Path,
+    output_format: str,
+    invert: bool,
+    normalize_low: float,
+    normalize_high: float,
+    gamma: float,
+) -> None:
     import numpy as np
     from PIL import Image
 
@@ -301,7 +309,9 @@ def save_depth(depth: Any, output_path: Path, output_format: str, invert: bool) 
         return
 
     valid = depth_array[finite]
-    low, high = np.percentile(valid, [1.0, 99.0])
+    normalize_low = max(0.0, min(99.0, float(normalize_low)))
+    normalize_high = max(normalize_low + 0.1, min(100.0, float(normalize_high)))
+    low, high = np.percentile(valid, [normalize_low, normalize_high])
     if high <= low:
         low = float(valid.min())
         high = float(valid.max())
@@ -312,6 +322,10 @@ def save_depth(depth: Any, output_path: Path, output_format: str, invert: bool) 
 
     if invert:
         normalized = 1.0 - normalized
+
+    gamma = max(0.2, min(4.0, float(gamma)))
+    if abs(gamma - 1.0) > 0.001:
+        normalized = np.power(normalized, gamma)
 
     normalized[~finite] = 0.0
 
@@ -463,12 +477,19 @@ def run_job(job: dict[str, Any]) -> None:
                 with TemporaryDirectory(prefix="depthmapai-") as temp:
                     inference_path = resized_input_for(image_path, options, Path(temp))
                     with torch.inference_mode():
-                        prediction = model.inference([str(inference_path)])
+                        prediction = model.inference(
+                            [str(inference_path)],
+                            process_res=int(options.get("processRes", 504)),
+                            process_res_method=options.get("processResMethod", "upper_bound_resize"),
+                        )
                 save_depth(
                     prediction.depth[0],
                     output_path,
                     options["outputFormat"],
                     bool(options["invert"]),
+                    float(options.get("normalizeLow", 1.0)),
+                    float(options.get("normalizeHigh", 99.0)),
+                    float(options.get("depthGamma", 1.0)),
                 )
                 outputs.append(str(output_path))
 

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow, PhysicalSize } from "@tauri-apps/api/window";
@@ -23,6 +23,11 @@ type Device = "auto" | "cuda" | "mps" | "cpu";
 type OutputFormat = "png8" | "png16" | "npy";
 type ModelRepo = "depth-anything/DA3-LARGE-1.1" | "depth-anything/DA3-SMALL";
 type ResizeMode = "none" | "width" | "height" | "long";
+type ProcessResMethod =
+  | "upper_bound_resize"
+  | "lower_bound_resize"
+  | "upper_bound_crop"
+  | "lower_bound_crop";
 type QueueStatus = "pending" | "running" | "done" | "error";
 
 type RuntimeStatus = {
@@ -65,6 +70,11 @@ type DepthOptions = {
   suffix: string;
   resizeMode: ResizeMode;
   resizeValue: number;
+  processRes: number;
+  processResMethod: ProcessResMethod;
+  normalizeLow: number;
+  normalizeHigh: number;
+  depthGamma: number;
 };
 
 type QueueItem = {
@@ -113,7 +123,12 @@ const defaultOptions: DepthOptions = {
   overwrite: false,
   suffix: "_depth",
   resizeMode: "none",
-  resizeValue: 1024
+  resizeValue: 1024,
+  processRes: 504,
+  processResMethod: "upper_bound_resize",
+  normalizeLow: 1,
+  normalizeHigh: 99,
+  depthGamma: 1
 };
 
 const MODEL_PROMPT_SEEN_KEY = "depthmapai.modelPromptSeen.v1";
@@ -166,6 +181,13 @@ function formatBytes(bytes: number) {
   return `${Math.round(bytes / (1024 * 1024))} MB`;
 }
 
+function previewOutputPath(outputPath?: string) {
+  return outputPath
+    ?.split(";")
+    .map((path) => path.trim())
+    .find((path) => /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(path));
+}
+
 function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [vram, setVram] = useState<VramStatus | null>(null);
@@ -175,6 +197,7 @@ function App() {
   const [headline, setHeadline] = useState("Drop images or folders");
   const [log, setLog] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [modelStatuses, setModelStatuses] = useState<Partial<Record<ModelRepo, ModelStatus>>>({});
   const [showModelPrompt, setShowModelPrompt] = useState(false);
   const [downloadingModel, setDownloadingModel] = useState<ModelRepo | null>(null);
@@ -191,6 +214,11 @@ function App() {
   const vramDisplay = useMemo(() => formatVram(vram), [vram]);
   const selectedModelStatus = modelStatuses[options.modelRepo];
   const activeDownload = downloadProgress;
+  const selectedItem = useMemo(
+    () => queue.find((item) => item.path === selectedPath) ?? queue[0],
+    [queue, selectedPath]
+  );
+  const previewOutput = previewOutputPath(selectedItem?.outputPath);
 
   const pushLog = useCallback((line: string) => {
     setLog((current) => [line, ...current].slice(0, 80));
@@ -304,6 +332,9 @@ function App() {
           .map((path) => ({ path, status: "pending" as const }));
         return [...current, ...additions];
       });
+      if (resolved.length > 0) {
+        setSelectedPath((current) => current ?? resolved[0]);
+      }
       setHeadline(`${resolved.length} image${resolved.length === 1 ? "" : "s"} ready`);
       pushLog(`Queued ${resolved.length} image${resolved.length === 1 ? "" : "s"}.`);
     },
@@ -570,6 +601,7 @@ function App() {
   const reset = () => {
     setQueue([]);
     setLog([]);
+    setSelectedPath(null);
     setHeadline("Drop images or folders");
   };
 
@@ -685,6 +717,99 @@ function App() {
                   setOptions((current) => ({
                     ...current,
                     resizeValue: Number(event.target.value) || current.resizeValue
+                  }))
+                }
+              />
+            </label>
+          </div>
+
+          <div className="split-fields">
+            <label className="field">
+              <span>DA3 resolution</span>
+              <input
+                type="range"
+                min="336"
+                max="1008"
+                step="14"
+                disabled={!options.generateDepth}
+                value={options.processRes}
+                onChange={(event) =>
+                  setOptions((current) => ({
+                    ...current,
+                    processRes: Number(event.target.value) || current.processRes
+                  }))
+                }
+              />
+            </label>
+
+            <label className="field">
+              <span>{options.processRes}px</span>
+              <select
+                value={options.processResMethod}
+                disabled={!options.generateDepth}
+                onChange={(event) =>
+                  setOptions((current) => ({
+                    ...current,
+                    processResMethod: event.target.value as ProcessResMethod
+                  }))
+                }
+              >
+                <option value="upper_bound_resize">Long side</option>
+                <option value="lower_bound_resize">Short side</option>
+                <option value="upper_bound_crop">Long crop</option>
+                <option value="lower_bound_crop">Short crop</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="triple-fields">
+            <label className="field">
+              <span>Black</span>
+              <input
+                type="number"
+                min="0"
+                max="98"
+                step="0.5"
+                disabled={!options.generateDepth}
+                value={options.normalizeLow}
+                onChange={(event) =>
+                  setOptions((current) => ({
+                    ...current,
+                    normalizeLow: Math.min(Number(event.target.value) || 0, current.normalizeHigh - 0.5)
+                  }))
+                }
+              />
+            </label>
+            <label className="field">
+              <span>White</span>
+              <input
+                type="number"
+                min="1"
+                max="100"
+                step="0.5"
+                disabled={!options.generateDepth}
+                value={options.normalizeHigh}
+                onChange={(event) =>
+                  setOptions((current) => ({
+                    ...current,
+                    normalizeHigh: Math.max(Number(event.target.value) || 100, current.normalizeLow + 0.5)
+                  }))
+                }
+              />
+            </label>
+            <label className="field">
+              <span>Gamma</span>
+              <input
+                type="number"
+                min="0.2"
+                max="4"
+                step="0.1"
+                disabled={!options.generateDepth}
+                value={options.depthGamma}
+                onChange={(event) =>
+                  setOptions((current) => ({
+                    ...current,
+                    depthGamma: Number(event.target.value) || current.depthGamma
                   }))
                 }
               />
@@ -869,13 +994,40 @@ function App() {
           </section>
         ) : null}
 
-        <section className={`drop-zone ${dragging ? "dragging" : ""}`}>
-          <Download size={42} />
-          <div>
-            <h3>Drop images or folders here</h3>
-            <p>Depth maps and WebP files are written beside each source image.</p>
-          </div>
-        </section>
+        <div className="media-grid">
+          <section className={`drop-zone ${dragging ? "dragging" : ""}`}>
+            <Download size={42} />
+            <div>
+              <h3>Drop images or folders here</h3>
+              <p>Depth maps and WebP files are written beside each source image.</p>
+            </div>
+          </section>
+
+          <section className="preview-panel">
+            <div className="preview-head">
+              <strong>Preview</strong>
+              <small>{selectedItem ? fileName(selectedItem.path) : "No image selected"}</small>
+            </div>
+            {selectedItem ? (
+              <div className="preview-images">
+                <div>
+                  <span>Input</span>
+                  <img src={convertFileSrc(selectedItem.path)} alt="Selected input preview" />
+                </div>
+                <div>
+                  <span>Output</span>
+                  {previewOutput ? (
+                    <img src={convertFileSrc(previewOutput)} alt="Generated output preview" />
+                  ) : (
+                    <div className="preview-empty">Pending</div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="preview-empty">Select or queue an image.</div>
+            )}
+          </section>
+        </div>
 
         <section className="queue">
           <div className="queue-header">
@@ -890,7 +1042,11 @@ function App() {
             </div>
           ) : (
             queue.map((item) => (
-              <div className={`queue-row ${item.status}`} key={item.path}>
+              <button
+                className={`queue-row ${item.status} ${selectedItem?.path === item.path ? "selected" : ""}`}
+                key={item.path}
+                onClick={() => setSelectedPath(item.path)}
+              >
                 <div>
                   <strong>{fileName(item.path)}</strong>
                   <small>{item.path}</small>
@@ -900,7 +1056,7 @@ function App() {
                   {item.message ?? item.status}
                 </div>
                 <small>{item.outputPath ?? "-"}</small>
-              </div>
+              </button>
             ))
           )}
         </section>

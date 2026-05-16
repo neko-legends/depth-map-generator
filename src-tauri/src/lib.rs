@@ -72,6 +72,11 @@ struct DepthOptions {
     suffix: String,
     resize_mode: String,
     resize_value: u32,
+    process_res: u32,
+    process_res_method: String,
+    normalize_low: f32,
+    normalize_high: f32,
+    depth_gamma: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -581,6 +586,11 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
         suffix: "_depth".to_string(),
         resize_mode: "none".to_string(),
         resize_value: 1024,
+        process_res: 504,
+        process_res_method: "upper_bound_resize".to_string(),
+        normalize_low: 1.0,
+        normalize_high: 99.0,
+        depth_gamma: 1.0,
     };
     let job = WorkerJob {
         paths: Vec::new(),
