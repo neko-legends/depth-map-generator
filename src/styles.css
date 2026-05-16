@@ -186,6 +186,23 @@ small,
   gap: 10px;
 }
 
+.output-folder-row {
+  display: grid;
+  grid-template-columns: 1fr 38px 58px;
+  gap: 8px;
+  align-items: center;
+}
+
+.output-folder-row .mini-button {
+  min-height: 34px;
+  padding: 0 8px;
+}
+
+.output-folder-row input {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .field span,
 .toggle span {
   color: #d8c9bc;
@@ -616,6 +633,10 @@ button:disabled {
 
 .queue-row.error .status {
   color: #ff766c;
+}
+
+.queue-row.canceled .status {
+  color: #ff9b6b;
 }
 
 .queue-row.running .status {

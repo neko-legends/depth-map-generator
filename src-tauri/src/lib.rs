@@ -5,14 +5,17 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
     thread,
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "jfif", "jpf", "jp2", "j2k", "webp", "bmp", "tif", "tiff",
@@ -70,6 +73,7 @@ struct DepthOptions {
     invert: bool,
     recursive: bool,
     overwrite: bool,
+    output_dir: String,
     suffix: String,
     resize_mode: String,
     resize_value: u32,
@@ -88,6 +92,70 @@ struct WorkerJob {
     env_dir: String,
     model_dir: String,
     download_only: bool,
+}
+
+#[derive(Clone, Default)]
+struct ActiveJobState {
+    inner: Arc<Mutex<Option<ActiveJob>>>,
+}
+
+struct ActiveJob {
+    id: String,
+    pid: u32,
+    cancel_requested: bool,
+}
+
+impl ActiveJobState {
+    fn is_busy(&self) -> Result<bool, String> {
+        self.inner
+            .lock()
+            .map(|job| job.is_some())
+            .map_err(|_| "Unable to lock active job state.".to_string())
+    }
+
+    fn start(&self, id: String, pid: u32) -> Result<(), String> {
+        let mut active = self
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock active job state.".to_string())?;
+        if active.is_some() {
+            return Err("Another job is already running.".to_string());
+        }
+        *active = Some(ActiveJob {
+            id,
+            pid,
+            cancel_requested: false,
+        });
+        Ok(())
+    }
+
+    fn request_cancel(&self) -> Result<u32, String> {
+        let mut active = self
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock active job state.".to_string())?;
+        let Some(job) = active.as_mut() else {
+            return Err("No active job to cancel.".to_string());
+        };
+        job.cancel_requested = true;
+        Ok(job.pid)
+    }
+
+    fn finish(&self, id: &str) -> Result<bool, String> {
+        let mut active = self
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock active job state.".to_string())?;
+        let Some(job) = active.as_ref() else {
+            return Ok(false);
+        };
+        if job.id != id {
+            return Ok(false);
+        }
+        let canceled = job.cancel_requested;
+        *active = None;
+        Ok(canceled)
+    }
 }
 
 fn worker_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -215,6 +283,49 @@ fn command_from_python_spec(spec: &str) -> Command {
     }
     hide_command_window(&mut command);
     command
+}
+
+fn configure_worker_command(command: &mut Command) {
+    hide_command_window(command);
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn kill_process_tree(pid: u32) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        command
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let mut command = Command::new("kill");
+        command.args(["-TERM", &format!("-{pid}")]);
+        command
+    };
+
+    hide_command_window(&mut command);
+    match command.output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            #[cfg(not(target_os = "windows"))]
+            {
+                let fallback = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+                if matches!(fallback, Ok(output) if output.status.success()) {
+                    return Ok(());
+                }
+            }
+            Err(format!(
+                "Unable to cancel job: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+        Err(error) => Err(format!("Unable to cancel job: {error}")),
+    }
 }
 
 fn managed_python_path(env_dir: &Path) -> PathBuf {
@@ -503,11 +614,15 @@ fn get_vram_status() -> VramStatus {
 #[tauri::command]
 fn start_depth_job(
     app: AppHandle,
+    active_jobs: State<'_, ActiveJobState>,
     paths: Vec<String>,
     options: DepthOptions,
 ) -> Result<String, String> {
     if paths.is_empty() {
         return Err("No input images were provided.".to_string());
+    }
+    if active_jobs.is_busy()? {
+        return Err("Another job is already running.".to_string());
     }
 
     let python = find_python()
@@ -534,6 +649,7 @@ fn start_depth_job(
     fs::write(&job_path, job_json).map_err(|error| format!("Unable to write job: {error}"))?;
 
     let mut command = command_from_python_spec(&python);
+    configure_worker_command(&mut command);
     command
         .arg(worker)
         .arg("--job")
@@ -544,10 +660,18 @@ fn start_depth_job(
     let mut child = command
         .spawn()
         .map_err(|error| format!("Unable to start Python worker: {error}"))?;
+    let child_pid = child.id();
+    if let Err(error) = active_jobs.start(job_id.clone(), child_pid) {
+        let _ = kill_process_tree(child_pid);
+        return Err(error);
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let app_for_stdout = app.clone();
     let app_for_stderr = app.clone();
+    let app_for_wait = app.clone();
+    let active_jobs_for_wait = active_jobs.inner().clone();
+    let job_id_for_wait = job_id.clone();
 
     thread::spawn(move || {
         if let Some(stdout) = stdout {
@@ -579,8 +703,19 @@ fn start_depth_job(
 
     thread::spawn(move || {
         let status = child.wait();
-        if !matches!(status, Ok(status) if status.success()) {
-            let _ = app.emit(
+        let was_canceled = active_jobs_for_wait
+            .finish(&job_id_for_wait)
+            .unwrap_or(false);
+        if was_canceled {
+            let _ = app_for_wait.emit(
+                "depth-worker-event",
+                serde_json::json!({
+                    "type": "canceled",
+                    "message": "Job canceled."
+                }),
+            );
+        } else if !matches!(status, Ok(status) if status.success()) {
+            let _ = app_for_wait.emit(
                 "depth-worker-event",
                 serde_json::json!({
                     "type": "error",
@@ -595,6 +730,10 @@ fn start_depth_job(
 
 #[tauri::command]
 fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> {
+    let active_jobs = app.state::<ActiveJobState>();
+    if active_jobs.is_busy()? {
+        return Err("Another job is already running.".to_string());
+    }
     let python = find_python()
         .ok_or_else(|| "Python 3.10, 3.11, or 3.12 was not found on PATH.".to_string())?;
     let worker = worker_path(&app)?;
@@ -616,6 +755,7 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
         invert: true,
         recursive: true,
         overwrite: false,
+        output_dir: String::new(),
         suffix: "_depth".to_string(),
         resize_mode: "none".to_string(),
         resize_value: 1024,
@@ -638,6 +778,7 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
     fs::write(&job_path, job_json).map_err(|error| format!("Unable to write job: {error}"))?;
 
     let mut command = command_from_python_spec(&python);
+    configure_worker_command(&mut command);
     command
         .arg(worker)
         .arg("--job")
@@ -648,10 +789,18 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
     let mut child = command
         .spawn()
         .map_err(|error| format!("Unable to start Python worker: {error}"))?;
+    let child_pid = child.id();
+    if let Err(error) = active_jobs.start(job_id.clone(), child_pid) {
+        let _ = kill_process_tree(child_pid);
+        return Err(error);
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let app_for_stdout = app.clone();
     let app_for_stderr = app.clone();
+    let app_for_wait = app.clone();
+    let active_jobs_for_wait = active_jobs.inner().clone();
+    let job_id_for_wait = job_id.clone();
 
     thread::spawn(move || {
         if let Some(stdout) = stdout {
@@ -683,8 +832,19 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
 
     thread::spawn(move || {
         let status = child.wait();
-        if !matches!(status, Ok(status) if status.success()) {
-            let _ = app.emit(
+        let was_canceled = active_jobs_for_wait
+            .finish(&job_id_for_wait)
+            .unwrap_or(false);
+        if was_canceled {
+            let _ = app_for_wait.emit(
+                "depth-worker-event",
+                serde_json::json!({
+                    "type": "canceled",
+                    "message": "Job canceled."
+                }),
+            );
+        } else if !matches!(status, Ok(status) if status.success()) {
+            let _ = app_for_wait.emit(
                 "depth-worker-event",
                 serde_json::json!({
                     "type": "error",
@@ -697,11 +857,19 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
     Ok(job_id)
 }
 
+#[tauri::command]
+fn cancel_active_job(active_jobs: State<'_, ActiveJobState>) -> Result<(), String> {
+    let pid = active_jobs.request_cancel()?;
+    kill_process_tree(pid)
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .manage(ActiveJobState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            cancel_active_job,
             check_runtime,
             get_model_status,
             get_vram_status,

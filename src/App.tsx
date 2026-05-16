@@ -13,6 +13,7 @@ import {
   Play,
   RotateCcw,
   Settings2,
+  Square,
   Sparkles,
   TriangleAlert,
   XCircle
@@ -28,7 +29,7 @@ type ProcessResMethod =
   | "lower_bound_resize"
   | "upper_bound_crop"
   | "lower_bound_crop";
-type QueueStatus = "pending" | "running" | "done" | "error";
+type QueueStatus = "pending" | "running" | "done" | "error" | "canceled";
 
 type RuntimeStatus = {
   pythonFound: boolean;
@@ -67,6 +68,7 @@ type DepthOptions = {
   invert: boolean;
   recursive: boolean;
   overwrite: boolean;
+  outputDir: string;
   suffix: string;
   resizeMode: ResizeMode;
   resizeValue: number;
@@ -93,7 +95,8 @@ type WorkerEvent = {
     | "image_done"
     | "image_error"
     | "done"
-    | "error";
+    | "error"
+    | "canceled";
   message?: string;
   path?: string;
   output?: string;
@@ -127,6 +130,7 @@ const defaultOptions: DepthOptions = {
   invert: true,
   recursive: true,
   overwrite: false,
+  outputDir: "",
   suffix: "_depth",
   resizeMode: "none",
   resizeValue: 1024,
@@ -200,6 +204,7 @@ function loadSavedOptions(): DepthOptions {
       invert: coerceBoolean(parsed.invert, defaultOptions.invert),
       recursive: coerceBoolean(parsed.recursive, defaultOptions.recursive),
       overwrite: coerceBoolean(parsed.overwrite, defaultOptions.overwrite),
+      outputDir: typeof parsed.outputDir === "string" ? parsed.outputDir : defaultOptions.outputDir,
       suffix: typeof parsed.suffix === "string" ? parsed.suffix : defaultOptions.suffix,
       resizeMode: coerceChoice(parsed.resizeMode, RESIZE_MODE_OPTIONS, defaultOptions.resizeMode),
       resizeValue: coerceNumber(parsed.resizeValue, defaultOptions.resizeValue, 64, 8192),
@@ -226,7 +231,7 @@ function loadSavedOptions(): DepthOptions {
 function statusIcon(status: QueueStatus) {
   if (status === "running") return <Loader2 className="spin" size={16} />;
   if (status === "done") return <CheckCircle2 size={16} />;
-  if (status === "error") return <XCircle size={16} />;
+  if (status === "error" || status === "canceled") return <XCircle size={16} />;
   return <Image size={16} />;
 }
 
@@ -261,6 +266,13 @@ function previewOutputPath(outputPath?: string) {
     .find((path) => /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(path));
 }
 
+function compactPath(path: string) {
+  if (!path) return "Same as source";
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 2) return path;
+  return `...${path.includes("\\") ? "\\" : "/"}${parts.slice(-2).join(path.includes("\\") ? "\\" : "/")}`;
+}
+
 function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [vram, setVram] = useState<VramStatus | null>(null);
@@ -268,6 +280,7 @@ function App() {
   const queueRef = useRef<QueueItem[]>([]);
   const [options, setOptions] = useState<DepthOptions>(loadSavedOptions);
   const [busy, setBusy] = useState(false);
+  const [canceling, setCanceling] = useState(false);
   const [headline, setHeadline] = useState("Drop images or folders");
   const [log, setLog] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -539,8 +552,19 @@ function App() {
         );
       }
 
-      if (payload.type === "done" || payload.type === "error") {
+      if (payload.type === "canceled") {
+        setQueue((current) =>
+          current.map((item) =>
+            item.status === "pending" || item.status === "running"
+              ? { ...item, status: "canceled", message: "Canceled" }
+              : item
+          )
+        );
+      }
+
+      if (payload.type === "done" || payload.type === "error" || payload.type === "canceled") {
         setBusy(false);
+        setCanceling(false);
         setDownloadingModel(null);
         setDownloadProgress(null);
         void refreshModelStatus().catch((error) =>
@@ -667,6 +691,29 @@ function App() {
     }
   };
 
+  const chooseOutputFolder = async () => {
+    if (!isTauriRuntime()) {
+      pushLog("Folder picking requires the Tauri desktop shell.");
+      return;
+    }
+    try {
+      const selected = await open({ multiple: false, directory: true });
+      if (typeof selected === "string") {
+        setOptions((current) => ({ ...current, outputDir: selected }));
+        pushLog(`Output folder set: ${selected}`);
+      } else {
+        pushLog("Output folder picker canceled.");
+      }
+    } catch (error) {
+      pushLog(`Output folder picker failed: ${String(error)}`);
+    }
+  };
+
+  const resetOutputFolder = () => {
+    setOptions((current) => ({ ...current, outputDir: "" }));
+    pushLog("Output folder reset to source folders.");
+  };
+
   const openModelFolder = async () => {
     if (!isTauriRuntime()) {
       pushLog("Opening the model folder requires the Tauri desktop shell.");
@@ -719,7 +766,9 @@ function App() {
     }
     if (busy || downloadingModel) return;
     const pendingPaths = queue
-      .filter((item) => item.status === "pending" || item.status === "error")
+      .filter(
+        (item) => item.status === "pending" || item.status === "error" || item.status === "canceled"
+      )
       .map((item) => item.path);
     const rerunningCompletedQueue = pendingPaths.length === 0 && queue.length > 0;
     const runnablePaths = rerunningCompletedQueue ? queue.map((item) => item.path) : pendingPaths;
@@ -728,16 +777,19 @@ function App() {
       pushLog("Enable depth generation, WebP conversion, or both.");
       return;
     }
-    const runOptions = rerunningCompletedQueue ? { ...options, overwrite: true } : options;
     if (rerunningCompletedQueue) {
-      pushLog("Rerunning queued images and replacing existing outputs.");
+      pushLog(
+        options.overwrite
+          ? "Rerunning queued images and replacing existing outputs."
+          : "Rerunning queued images. Existing outputs will get numbered filenames."
+      );
     }
-    if (runOptions.generateDepth && !modelStatuses[runOptions.modelRepo]?.installed) {
+    if (options.generateDepth && !modelStatuses[options.modelRepo]?.installed) {
       setDownloadProgress({
-        modelRepo: runOptions.modelRepo,
-        message: `Preparing ${modelName(runOptions.modelRepo)}`,
+        modelRepo: options.modelRepo,
+        message: `Preparing ${modelName(options.modelRepo)}`,
         bytesDownloaded: 0,
-        bytesTotal: modelStatuses[runOptions.modelRepo]?.sizeBytes ?? 0,
+        bytesTotal: modelStatuses[options.modelRepo]?.sizeBytes ?? 0,
         percent: 0
       });
     }
@@ -750,12 +802,26 @@ function App() {
       )
     );
     try {
-      await invoke("start_depth_job", { paths: runnablePaths, options: runOptions });
+      await invoke("start_depth_job", { paths: runnablePaths, options });
     } catch (error) {
       setBusy(false);
+      setCanceling(false);
       setDownloadProgress(null);
       pushLog(String(error));
       setHeadline("Unable to start worker");
+    }
+  };
+
+  const cancelActiveJob = async () => {
+    if (!isTauriRuntime() || (!busy && !downloadingModel) || canceling) return;
+    setCanceling(true);
+    setHeadline("Canceling job");
+    pushLog("Cancel requested.");
+    try {
+      await invoke("cancel_active_job");
+    } catch (error) {
+      setCanceling(false);
+      pushLog(`Cancel failed: ${String(error)}`);
     }
   };
 
@@ -847,6 +913,19 @@ function App() {
               }
             />
           </label>
+
+          <div className="field">
+            <span>Output folder</span>
+            <div className="output-folder-row">
+              <input value={compactPath(options.outputDir)} title={options.outputDir || "Same as source"} readOnly />
+              <button className="secondary mini-button" onClick={chooseOutputFolder} title="Choose output folder">
+                <FolderOpen size={14} />
+              </button>
+              <button className="secondary mini-button" onClick={resetOutputFolder} title="Use source folders">
+                Same
+              </button>
+            </div>
+          </div>
 
           <div className="split-fields">
             <label className="field">
@@ -1141,6 +1220,14 @@ function App() {
               {busy ? <Loader2 className="spin" size={17} /> : <Play size={17} />}
               Generate
             </button>
+            <button
+              className="secondary"
+              disabled={(!busy && !downloadingModel) || canceling}
+              onClick={cancelActiveJob}
+            >
+              {canceling ? <Loader2 className="spin" size={17} /> : <Square size={17} />}
+              Cancel
+            </button>
           </div>
         </header>
 
@@ -1186,7 +1273,11 @@ function App() {
             <Download size={42} />
             <div>
               <h3>Drop images or folders here</h3>
-              <p>Depth maps and WebP files are written beside each source image.</p>
+              <p>
+                {options.outputDir
+                  ? "Depth maps and WebP files are written to the selected output folder."
+                  : "Depth maps and WebP files are written beside each source image."}
+              </p>
             </div>
           </section>
 

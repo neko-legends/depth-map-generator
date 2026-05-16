@@ -206,13 +206,44 @@ def choose_device(requested: str):
     return torch.device("cpu")
 
 
-def output_path_for(image_path: Path, suffix: str, output_format: str) -> Path:
+def output_dir_for(image_path: Path, options: dict[str, Any]) -> Path:
+    output_dir = str(options.get("outputDir") or "").strip()
+    directory = Path(output_dir).expanduser() if output_dir else image_path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    if not directory.is_dir():
+        raise RuntimeError(f"Output folder is not a directory: {directory}")
+    return directory
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 10000):
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not find an available output name for {path.name}.")
+
+
+def final_output_path(path: Path, overwrite: bool) -> Path:
+    return path if overwrite else unique_path(path)
+
+
+def output_path_for(
+    image_path: Path,
+    suffix: str,
+    output_format: str,
+    options: dict[str, Any],
+    overwrite: bool,
+) -> Path:
     extension = ".npy" if output_format == "npy" else ".png"
-    return image_path.with_name(f"{image_path.stem}{suffix}{extension}")
+    base_path = output_dir_for(image_path, options) / f"{image_path.stem}{suffix}{extension}"
+    return final_output_path(base_path, overwrite)
 
 
-def webp_output_path_for(image_path: Path) -> Path:
-    return image_path.with_suffix(".webp")
+def webp_output_path_for(image_path: Path, options: dict[str, Any], overwrite: bool) -> Path:
+    base_path = output_dir_for(image_path, options) / f"{image_path.stem}.webp"
+    return final_output_path(base_path, overwrite)
 
 
 def has_alpha(image: Any) -> bool:
@@ -223,14 +254,17 @@ def has_alpha(image: Any) -> bool:
     return False
 
 
-def convert_source_to_webp(image_path: Path, overwrite: bool, quality: int) -> tuple[Path, str]:
+def convert_source_to_webp(
+    image_path: Path,
+    options: dict[str, Any],
+    overwrite: bool,
+    quality: int,
+) -> tuple[Path, str]:
     from PIL import Image, ImageOps
 
-    output_path = webp_output_path_for(image_path)
-    if image_path.suffix.lower() == ".webp":
+    output_path = webp_output_path_for(image_path, options, overwrite)
+    if image_path.suffix.lower() == ".webp" and output_path.resolve() == image_path.resolve():
         return output_path, "Already WebP"
-    if output_path.exists() and not overwrite:
-        return output_path, "Skipped existing WebP"
 
     quality = max(1, min(100, int(quality)))
     with Image.open(image_path) as image:
@@ -423,6 +457,7 @@ def run_job(job: dict[str, Any]) -> None:
     model = None
     torch = None
     download_only = bool(job.get("download_only", False))
+    overwrite = bool(options.get("overwrite", False))
 
     if download_only:
         model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
@@ -448,7 +483,13 @@ def run_job(job: dict[str, Any]) -> None:
         model.eval()
 
     for image_path in paths:
-        output_path = output_path_for(image_path, options["suffix"], options["outputFormat"])
+        output_path = output_path_for(
+            image_path,
+            options["suffix"],
+            options["outputFormat"],
+            options,
+            overwrite,
+        )
         outputs: list[str] = []
 
         try:
@@ -456,35 +497,33 @@ def run_job(job: dict[str, Any]) -> None:
             if convert_webp:
                 webp_path, webp_note = convert_source_to_webp(
                     image_path,
-                    bool(options["overwrite"]),
+                    options,
+                    overwrite,
                     int(options.get("webpQuality", 92)),
                 )
                 outputs.append(str(webp_path))
                 emit("setup", f"{image_path.name}: {webp_note}")
 
             if generate_depth:
-                if output_path.exists() and not options["overwrite"]:
-                    emit("setup", f"{image_path.name}: Skipped existing depth output")
-                else:
-                    assert torch is not None
-                    assert model is not None
-                    with TemporaryDirectory(prefix="depthmapai-") as temp:
-                        inference_path = resized_input_for(image_path, options, Path(temp))
-                        with torch.inference_mode():
-                            prediction = model.inference(
-                                [str(inference_path)],
-                                process_res=int(options.get("processRes", 504)),
-                                process_res_method=options.get("processResMethod", "upper_bound_resize"),
-                            )
-                    save_depth(
-                        prediction.depth[0],
-                        output_path,
-                        options["outputFormat"],
-                        bool(options["invert"]),
-                        float(options.get("normalizeLow", 1.0)),
-                        float(options.get("normalizeHigh", 99.0)),
-                        float(options.get("depthGamma", 1.0)),
-                    )
+                assert torch is not None
+                assert model is not None
+                with TemporaryDirectory(prefix="depthmapai-") as temp:
+                    inference_path = resized_input_for(image_path, options, Path(temp))
+                    with torch.inference_mode():
+                        prediction = model.inference(
+                            [str(inference_path)],
+                            process_res=int(options.get("processRes", 504)),
+                            process_res_method=options.get("processResMethod", "upper_bound_resize"),
+                        )
+                save_depth(
+                    prediction.depth[0],
+                    output_path,
+                    options["outputFormat"],
+                    bool(options["invert"]),
+                    float(options.get("normalizeLow", 1.0)),
+                    float(options.get("normalizeHigh", 99.0)),
+                    float(options.get("depthGamma", 1.0)),
+                )
                 outputs.append(str(output_path))
 
             emit(

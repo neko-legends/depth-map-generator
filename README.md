@@ -14,11 +14,15 @@ download, depth map export, and WebP conversion.
 - Drag in one image, many images, or folders.
 - Recursively scan image folders.
 - Generate depth maps beside source images.
+- Optional output folder override, with same-folder output as the default.
+- Cancel active model downloads or batch jobs.
 - Optional resize-before-depth mode with aspect ratio preserved.
 - Depth outputs: 8-bit PNG, 16-bit PNG, or raw `.npy`.
 - Optional source-image WebP conversion.
 - PNG alpha is preserved with lossless WebP.
 - JPG-style inputs use configurable WebP quality.
+- Existing outputs get numbered filenames such as `_depth_2.png` when overwrite
+  is off.
 - Model selector:
   - `depth-anything/DA3-LARGE-1.1` by default.
   - `depth-anything/DA3-SMALL` for lower VRAM machines.
@@ -187,6 +191,15 @@ On first launch, the app offers to download either DA3-LARGE-1.1 or DA3-SMALL.
 Choosing Later skips the download. If depth generation is later started with no
 selected model installed, the worker downloads that model before inference and
 shows download progress in the UI.
+
+By default, outputs are written beside each source image. The Settings panel can
+choose a single output folder instead. When overwrite is off and a target output
+already exists, the worker writes the next available numbered filename instead
+of replacing or skipping the file, for example `image_depth_2.png`.
+
+The Cancel button stops the active Python worker process tree. A canceled model
+download may leave an incomplete temporary download file, which is replaced on
+the next download attempt.
 
 The first WebP or depth run creates an app-managed Python virtual environment in
 the app data folder. It is separate from project `.venv` folders and avoids
