@@ -705,31 +705,40 @@ function App() {
       pushLog("Generation requires the Tauri desktop shell.");
       return;
     }
-    const pending = queue
+    if (busy || downloadingModel) return;
+    const pendingPaths = queue
       .filter((item) => item.status === "pending" || item.status === "error")
       .map((item) => item.path);
-    if (pending.length === 0 || busy || downloadingModel) return;
+    const rerunningCompletedQueue = pendingPaths.length === 0 && queue.length > 0;
+    const runnablePaths = rerunningCompletedQueue ? queue.map((item) => item.path) : pendingPaths;
+    if (runnablePaths.length === 0) return;
     if (!options.generateDepth && !options.convertWebp) {
       pushLog("Enable depth generation, WebP conversion, or both.");
       return;
     }
-    if (options.generateDepth && !modelStatuses[options.modelRepo]?.installed) {
+    const runOptions = rerunningCompletedQueue ? { ...options, overwrite: true } : options;
+    if (rerunningCompletedQueue) {
+      pushLog("Rerunning queued images and replacing existing outputs.");
+    }
+    if (runOptions.generateDepth && !modelStatuses[runOptions.modelRepo]?.installed) {
       setDownloadProgress({
-        modelRepo: options.modelRepo,
-        message: `Preparing ${modelName(options.modelRepo)}`,
+        modelRepo: runOptions.modelRepo,
+        message: `Preparing ${modelName(runOptions.modelRepo)}`,
         bytesDownloaded: 0,
-        bytesTotal: modelStatuses[options.modelRepo]?.sizeBytes ?? 0,
+        bytesTotal: modelStatuses[runOptions.modelRepo]?.sizeBytes ?? 0,
         percent: 0
       });
     }
     setBusy(true);
     setQueue((current) =>
       current.map((item) =>
-        pending.includes(item.path) ? { ...item, status: "pending", message: undefined } : item
+        runnablePaths.includes(item.path)
+          ? { ...item, status: "pending", outputPath: undefined, message: undefined }
+          : item
       )
     );
     try {
-      await invoke("start_depth_job", { paths: pending, options });
+      await invoke("start_depth_job", { paths: runnablePaths, options: runOptions });
     } catch (error) {
       setBusy(false);
       pushLog(String(error));
