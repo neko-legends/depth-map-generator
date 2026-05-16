@@ -137,7 +137,18 @@ const defaultOptions: DepthOptions = {
   depthGamma: 1
 };
 
+const SETTINGS_STORAGE_KEY = "depthmapai.settings.v1";
 const MODEL_PROMPT_SEEN_KEY = "depthmapai.modelPromptSeen.v1";
+const DEVICE_OPTIONS: Device[] = ["auto", "cuda", "mps", "cpu"];
+const OUTPUT_FORMAT_OPTIONS: OutputFormat[] = ["png8", "png16", "npy"];
+const MODEL_REPO_OPTIONS: ModelRepo[] = ["depth-anything/DA3-LARGE-1.1", "depth-anything/DA3-SMALL"];
+const RESIZE_MODE_OPTIONS: ResizeMode[] = ["none", "width", "height", "long"];
+const PROCESS_RES_METHOD_OPTIONS: ProcessResMethod[] = [
+  "upper_bound_resize",
+  "lower_bound_resize",
+  "upper_bound_crop",
+  "lower_bound_crop"
+];
 const MODEL_DETAILS: Record<ModelRepo, { name: string; size: string; vram: string; note: string }> = {
   "depth-anything/DA3-LARGE-1.1": {
     name: "DA3-LARGE-1.1",
@@ -155,6 +166,62 @@ const MODEL_DETAILS: Record<ModelRepo, { name: string; size: string; vram: strin
 
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 const isTauriRuntime = () => "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
+
+function coerceChoice<T extends string>(value: unknown, choices: T[], fallback: T) {
+  return typeof value === "string" && choices.includes(value as T) ? (value as T) : fallback;
+}
+
+function coerceBoolean(value: unknown, fallback: boolean) {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function coerceNumber(value: unknown, fallback: number, min: number, max: number) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(min, Math.min(max, value))
+    : fallback;
+}
+
+function loadSavedOptions(): DepthOptions {
+  if (typeof window === "undefined") return defaultOptions;
+
+  try {
+    const saved = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!saved) return defaultOptions;
+    const parsedValue = JSON.parse(saved);
+    if (!parsedValue || typeof parsedValue !== "object") return defaultOptions;
+    const parsed = parsedValue as Partial<DepthOptions>;
+    const loaded = {
+      device: coerceChoice(parsed.device, DEVICE_OPTIONS, defaultOptions.device),
+      modelRepo: coerceChoice(parsed.modelRepo, MODEL_REPO_OPTIONS, defaultOptions.modelRepo),
+      outputFormat: coerceChoice(parsed.outputFormat, OUTPUT_FORMAT_OPTIONS, defaultOptions.outputFormat),
+      generateDepth: coerceBoolean(parsed.generateDepth, defaultOptions.generateDepth),
+      convertWebp: coerceBoolean(parsed.convertWebp, defaultOptions.convertWebp),
+      webpQuality: coerceNumber(parsed.webpQuality, defaultOptions.webpQuality, 1, 100),
+      invert: coerceBoolean(parsed.invert, defaultOptions.invert),
+      recursive: coerceBoolean(parsed.recursive, defaultOptions.recursive),
+      overwrite: coerceBoolean(parsed.overwrite, defaultOptions.overwrite),
+      suffix: typeof parsed.suffix === "string" ? parsed.suffix : defaultOptions.suffix,
+      resizeMode: coerceChoice(parsed.resizeMode, RESIZE_MODE_OPTIONS, defaultOptions.resizeMode),
+      resizeValue: coerceNumber(parsed.resizeValue, defaultOptions.resizeValue, 64, 8192),
+      processRes: coerceNumber(parsed.processRes, defaultOptions.processRes, 336, 1008),
+      processResMethod: coerceChoice(
+        parsed.processResMethod,
+        PROCESS_RES_METHOD_OPTIONS,
+        defaultOptions.processResMethod
+      ),
+      normalizeLow: coerceNumber(parsed.normalizeLow, defaultOptions.normalizeLow, 0, 99),
+      normalizeHigh: coerceNumber(parsed.normalizeHigh, defaultOptions.normalizeHigh, 1, 100),
+      depthGamma: coerceNumber(parsed.depthGamma, defaultOptions.depthGamma, 0.2, 4)
+    };
+    if (loaded.normalizeLow >= loaded.normalizeHigh) {
+      loaded.normalizeLow = defaultOptions.normalizeLow;
+      loaded.normalizeHigh = defaultOptions.normalizeHigh;
+    }
+    return loaded;
+  } catch {
+    return defaultOptions;
+  }
+}
 
 function statusIcon(status: QueueStatus) {
   if (status === "running") return <Loader2 className="spin" size={16} />;
@@ -198,7 +265,7 @@ function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [vram, setVram] = useState<VramStatus | null>(null);
   const [queue, setQueue] = useState<QueueItem[]>([]);
-  const [options, setOptions] = useState<DepthOptions>(defaultOptions);
+  const [options, setOptions] = useState<DepthOptions>(loadSavedOptions);
   const [busy, setBusy] = useState(false);
   const [headline, setHeadline] = useState("Drop images or folders");
   const [log, setLog] = useState<string[]>([]);
@@ -230,6 +297,10 @@ function App() {
   const pushLog = useCallback((line: string) => {
     setLog((current) => [line, ...current].slice(0, 80));
   }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(options));
+  }, [options]);
 
   useEffect(() => {
     if (!selectedItem || !isTauriRuntime()) {
@@ -610,6 +681,11 @@ function App() {
     }
   };
 
+  const resetSettings = () => {
+    setOptions(defaultOptions);
+    pushLog("Settings reset to defaults.");
+  };
+
   const resetDepthTuning = () => {
     setOptions((current) => ({
       ...current,
@@ -686,6 +762,10 @@ function App() {
           <div className="panel-title">
             <Settings2 size={16} />
             Settings
+            <button className="secondary mini-button" onClick={resetSettings} title="Reset all settings">
+              <RotateCcw size={14} />
+              Reset
+            </button>
           </div>
 
           <label className="field">

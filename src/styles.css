@@ -150,6 +150,10 @@ small,
   font-weight: 700;
 }
 
+.panel-title .mini-button {
+  margin-left: auto;
+}
+
 .tuning-header {
   display: flex;
   justify-content: space-between;
