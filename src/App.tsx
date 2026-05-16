@@ -17,7 +17,7 @@ import {
   TriangleAlert,
   XCircle
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Device = "auto" | "cuda" | "mps" | "cpu";
 type OutputFormat = "png8" | "png16" | "npy";
@@ -265,6 +265,7 @@ function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [vram, setVram] = useState<VramStatus | null>(null);
   const [queue, setQueue] = useState<QueueItem[]>([]);
+  const queueRef = useRef<QueueItem[]>([]);
   const [options, setOptions] = useState<DepthOptions>(loadSavedOptions);
   const [busy, setBusy] = useState(false);
   const [headline, setHeadline] = useState("Drop images or folders");
@@ -297,6 +298,10 @@ function App() {
   const pushLog = useCallback((line: string) => {
     setLog((current) => [line, ...current].slice(0, 80));
   }, []);
+
+  useEffect(() => {
+    queueRef.current = queue;
+  }, [queue]);
 
   useEffect(() => {
     window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(options));
@@ -444,8 +449,14 @@ function App() {
       if (resolved.length > 0) {
         setSelectedPath((current) => current ?? resolved[0]);
       }
-      setHeadline(`${resolved.length} image${resolved.length === 1 ? "" : "s"} ready`);
-      pushLog(`Queued ${resolved.length} image${resolved.length === 1 ? "" : "s"}.`);
+      const knownBeforeAdd = new Set(queueRef.current.map((item) => item.path));
+      const addedCount = resolved.filter((path) => !knownBeforeAdd.has(path)).length;
+      setHeadline(`${addedCount} new image${addedCount === 1 ? "" : "s"} ready`);
+      pushLog(
+        addedCount === resolved.length
+          ? `Queued ${addedCount} image${addedCount === 1 ? "" : "s"}.`
+          : `Queued ${addedCount} new image${addedCount === 1 ? "" : "s"}; ${resolved.length - addedCount} duplicate${resolved.length - addedCount === 1 ? "" : "s"} skipped.`
+      );
     },
     [options.recursive, pushLog]
   );
@@ -531,6 +542,7 @@ function App() {
       if (payload.type === "done" || payload.type === "error") {
         setBusy(false);
         setDownloadingModel(null);
+        setDownloadProgress(null);
         void refreshModelStatus().catch((error) =>
           pushLog(`Could not refresh model status: ${String(error)}`)
         );
@@ -741,6 +753,7 @@ function App() {
       await invoke("start_depth_job", { paths: runnablePaths, options: runOptions });
     } catch (error) {
       setBusy(false);
+      setDownloadProgress(null);
       pushLog(String(error));
       setHeadline("Unable to start worker");
     }

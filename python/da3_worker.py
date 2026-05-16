@@ -451,15 +451,6 @@ def run_job(job: dict[str, Any]) -> None:
         output_path = output_path_for(image_path, options["suffix"], options["outputFormat"])
         outputs: list[str] = []
 
-        if generate_depth and output_path.exists() and not options["overwrite"]:
-            emit(
-                "image_done",
-                "Skipped existing output",
-                path=str(image_path),
-                output=str(output_path),
-            )
-            continue
-
         try:
             emit("image_start", f"Processing {image_path.name}", path=str(image_path))
             if convert_webp:
@@ -472,25 +463,28 @@ def run_job(job: dict[str, Any]) -> None:
                 emit("setup", f"{image_path.name}: {webp_note}")
 
             if generate_depth:
-                assert torch is not None
-                assert model is not None
-                with TemporaryDirectory(prefix="depthmapai-") as temp:
-                    inference_path = resized_input_for(image_path, options, Path(temp))
-                    with torch.inference_mode():
-                        prediction = model.inference(
-                            [str(inference_path)],
-                            process_res=int(options.get("processRes", 504)),
-                            process_res_method=options.get("processResMethod", "upper_bound_resize"),
-                        )
-                save_depth(
-                    prediction.depth[0],
-                    output_path,
-                    options["outputFormat"],
-                    bool(options["invert"]),
-                    float(options.get("normalizeLow", 1.0)),
-                    float(options.get("normalizeHigh", 99.0)),
-                    float(options.get("depthGamma", 1.0)),
-                )
+                if output_path.exists() and not options["overwrite"]:
+                    emit("setup", f"{image_path.name}: Skipped existing depth output")
+                else:
+                    assert torch is not None
+                    assert model is not None
+                    with TemporaryDirectory(prefix="depthmapai-") as temp:
+                        inference_path = resized_input_for(image_path, options, Path(temp))
+                        with torch.inference_mode():
+                            prediction = model.inference(
+                                [str(inference_path)],
+                                process_res=int(options.get("processRes", 504)),
+                                process_res_method=options.get("processResMethod", "upper_bound_resize"),
+                            )
+                    save_depth(
+                        prediction.depth[0],
+                        output_path,
+                        options["outputFormat"],
+                        bool(options["invert"]),
+                        float(options.get("normalizeLow", 1.0)),
+                        float(options.get("normalizeHigh", 99.0)),
+                        float(options.get("depthGamma", 1.0)),
+                    )
                 outputs.append(str(output_path))
 
             emit(
