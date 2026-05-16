@@ -95,8 +95,8 @@ npm run tauri:build
 Expected Windows outputs:
 
 - `src-tauri\target\release\depth-map-ai-generator.exe`
-- `src-tauri\target\release\bundle\nsis\DepthMap AI Generator_0.1.0_x64-setup.exe`
-- `src-tauri\target\release\bundle\msi\DepthMap AI Generator_0.1.0_x64_en-US.msi`
+- `src-tauri\target\release\bundle\nsis\DepthMap AI Generator_0.1.1_x64-setup.exe`
+- `src-tauri\target\release\bundle\msi\DepthMap AI Generator_0.1.1_x64_en-US.msi`
 
 Runtime notes for agents:
 

@@ -1,6 +1,6 @@
 [package]
 name = "depth-map-ai-generator"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local DA3 depth map generator"
 authors = ["DepthMap AI Generator contributors"]
 license = "MIT"
