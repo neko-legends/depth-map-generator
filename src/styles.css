@@ -150,6 +150,26 @@ small,
   font-weight: 700;
 }
 
+.tuning-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 8px;
+}
+
+.tuning-header span {
+  color: #ffd1a5;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.mini-button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
 .field {
   display: grid;
   gap: 5px;

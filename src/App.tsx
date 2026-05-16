@@ -561,6 +561,20 @@ function App() {
     }
   };
 
+  const resetDepthTuning = () => {
+    setOptions((current) => ({
+      ...current,
+      processRes: defaultOptions.processRes,
+      processResMethod: defaultOptions.processResMethod,
+      normalizeLow: defaultOptions.normalizeLow,
+      normalizeHigh: defaultOptions.normalizeHigh,
+      depthGamma: defaultOptions.depthGamma
+    }));
+    pushLog(
+      `Depth tuning reset: ${defaultOptions.processRes}px, long side, black ${defaultOptions.normalizeLow}, white ${defaultOptions.normalizeHigh}, gamma ${defaultOptions.depthGamma}.`
+    );
+  };
+
   const start = async () => {
     if (!isTauriRuntime()) {
       pushLog("Generation requires the Tauri desktop shell.");
@@ -721,6 +735,14 @@ function App() {
                 }
               />
             </label>
+          </div>
+
+          <div className="tuning-header">
+            <span>Depth tuning</span>
+            <button className="secondary mini-button" onClick={resetDepthTuning} title="Reset depth tuning">
+              <RotateCcw size={14} />
+              Reset
+            </button>
           </div>
 
           <div className="split-fields">
