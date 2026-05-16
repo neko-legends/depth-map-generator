@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -309,6 +310,23 @@ fn model_dir_for(app_data: &Path, model_repo: &str) -> Result<PathBuf, String> {
     Ok(app_data.join("models").join(model_cache_name(model_repo)?))
 }
 
+fn image_mime_type(path: &Path) -> Result<&'static str, String> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Ok("image/png"),
+        Some("jpg") | Some("jpeg") | Some("jpe") | Some("jfif") => Ok("image/jpeg"),
+        Some("webp") => Ok("image/webp"),
+        Some("bmp") => Ok("image/bmp"),
+        Some("tif") | Some("tiff") => Ok("image/tiff"),
+        Some(extension) => Err(format!("Unsupported preview image extension: {extension}")),
+        None => Err("Preview image has no file extension.".to_string()),
+    }
+}
+
 #[tauri::command]
 fn check_runtime(app: AppHandle) -> Result<RuntimeStatus, String> {
     let app_data = app_data_dir(&app)?;
@@ -400,6 +418,21 @@ Model files are downloaded separately from:
     app.opener()
         .open_path(report_path.display().to_string(), None::<&str>)
         .map_err(|error| format!("Unable to open package report: {error}"))
+}
+
+#[tauri::command]
+fn preview_image_data_url(path: String) -> Result<String, String> {
+    let image_path = PathBuf::from(path);
+    if !image_path.is_file() {
+        return Err("Preview image was not found.".to_string());
+    }
+    let mime_type = image_mime_type(&image_path)?;
+    let bytes =
+        fs::read(&image_path).map_err(|error| format!("Unable to read preview image: {error}"))?;
+    Ok(format!(
+        "data:{mime_type};base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 #[tauri::command]
@@ -675,6 +708,7 @@ pub fn run() {
             download_model,
             open_model_folder,
             open_package_report,
+            preview_image_data_url,
             resolve_inputs,
             start_depth_job
         ])

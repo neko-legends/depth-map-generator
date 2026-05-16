@@ -517,8 +517,15 @@ button:disabled {
   background: rgba(8, 7, 6, 0.72);
 }
 
-.preview-images div {
+.preview-images > div {
   grid-template-rows: 24px 1fr;
+}
+
+.preview-images > div > .preview-empty {
+  width: 100%;
+  height: 112px;
+  border: 0;
+  background: transparent;
 }
 
 .preview-images img {
@@ -531,6 +538,12 @@ button:disabled {
   height: 142px;
   color: #a89788;
   font-weight: 800;
+}
+
+.preview-error {
+  display: block;
+  margin-top: 8px;
+  color: #ff766c;
 }
 
 .queue,

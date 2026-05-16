@@ -1,4 +1,4 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow, PhysicalSize } from "@tauri-apps/api/window";
@@ -111,6 +111,12 @@ type DownloadProgress = {
   percent: number | null;
 };
 
+type PreviewImages = {
+  input?: string;
+  output?: string;
+  error?: string;
+};
+
 const defaultOptions: DepthOptions = {
   device: "auto",
   modelRepo: "depth-anything/DA3-LARGE-1.1",
@@ -198,6 +204,7 @@ function App() {
   const [log, setLog] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [previewImages, setPreviewImages] = useState<PreviewImages>({});
   const [modelStatuses, setModelStatuses] = useState<Partial<Record<ModelRepo, ModelStatus>>>({});
   const [showModelPrompt, setShowModelPrompt] = useState(false);
   const [downloadingModel, setDownloadingModel] = useState<ModelRepo | null>(null);
@@ -223,6 +230,37 @@ function App() {
   const pushLog = useCallback((line: string) => {
     setLog((current) => [line, ...current].slice(0, 80));
   }, []);
+
+  useEffect(() => {
+    if (!selectedItem || !isTauriRuntime()) {
+      setPreviewImages({});
+      return;
+    }
+
+    let canceled = false;
+    setPreviewImages({});
+
+    const loadPreview = async () => {
+      try {
+        const input = await invoke<string>("preview_image_data_url", { path: selectedItem.path });
+        const output = previewOutput
+          ? await invoke<string>("preview_image_data_url", { path: previewOutput })
+          : undefined;
+        if (!canceled) {
+          setPreviewImages({ input, output });
+        }
+      } catch (error) {
+        if (!canceled) {
+          setPreviewImages({ error: String(error) });
+        }
+      }
+    };
+
+    void loadPreview();
+    return () => {
+      canceled = true;
+    };
+  }, [previewOutput, selectedItem]);
 
   const refreshModelStatus = useCallback(async () => {
     if (!isTauriRuntime()) return [] as ModelStatus[];
@@ -442,6 +480,7 @@ function App() {
       }
     });
     let aspectTimer: number | undefined;
+    let aspectAdjusting = false;
     const enforceAspectRatio = async () => {
       const windowHandle = getCurrentWindow();
       const size = await windowHandle.outerSize();
@@ -462,16 +501,26 @@ function App() {
       }
 
       if (Math.abs(width - size.width) > 1 || Math.abs(height - size.height) > 1) {
-        await windowHandle.setSize(new PhysicalSize(width, height));
+        aspectAdjusting = true;
+        try {
+          await windowHandle.setSize(new PhysicalSize(width, height));
+        } finally {
+          window.setTimeout(() => {
+            aspectAdjusting = false;
+          }, 250);
+        }
       }
     };
     const aspectPromise = getCurrentWindow().onResized(() => {
+      if (aspectAdjusting) {
+        return;
+      }
       if (aspectTimer !== undefined) {
         window.clearTimeout(aspectTimer);
       }
       aspectTimer = window.setTimeout(() => {
         void enforceAspectRatio();
-      }, 160);
+      }, 850);
     });
 
     return () => {
@@ -1048,12 +1097,16 @@ function App() {
               <div className="preview-images">
                 <div>
                   <span>Input</span>
-                  <img src={convertFileSrc(selectedItem.path)} alt="Selected input preview" />
+                  {previewImages.input ? (
+                    <img src={previewImages.input} alt="" />
+                  ) : (
+                    <div className="preview-empty">Loading</div>
+                  )}
                 </div>
                 <div>
                   <span>Output</span>
-                  {previewOutput ? (
-                    <img src={convertFileSrc(previewOutput)} alt="Generated output preview" />
+                  {previewImages.output ? (
+                    <img src={previewImages.output} alt="" />
                   ) : (
                     <div className="preview-empty">Pending</div>
                   )}
@@ -1062,6 +1115,7 @@ function App() {
             ) : (
               <div className="preview-empty">Select or queue an image.</div>
             )}
+            {previewImages.error ? <small className="preview-error">{previewImages.error}</small> : null}
           </section>
         </div>
 
