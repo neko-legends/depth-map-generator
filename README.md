@@ -33,7 +33,7 @@ download, depth map export, and WebP conversion.
 
 Prerequisites:
 
-- Node.js 20+
+- Node.js 20.19+ or 22.12+
 - Rust toolchain for Tauri builds
 - Python 3.10, 3.11, or 3.12
 - Git
@@ -60,15 +60,16 @@ cargo --version
 rustc --version
 ```
 
-3. Install JavaScript dependencies.
+3. Install JavaScript dependencies from the committed lockfile.
 
 ```powershell
-npm install
+npm ci
 ```
 
-4. Run source checks.
+4. Run source and package checks.
 
 ```powershell
+npm audit
 npm run build
 python -m py_compile python\da3_worker.py
 ```
@@ -105,11 +106,14 @@ Runtime notes for agents:
   dependencies may not publish compatible wheels yet.
 - NVIDIA VRAM display depends on `nvidia-smi`; it is allowed to show unavailable
   on machines without NVIDIA drivers.
+- Use `npm ci` for reproducible installs. Do not use `npm install` unless the
+  task is specifically to update JavaScript packages and commit the resulting
+  `package-lock.json` change.
 
-Install JavaScript dependencies:
+Install JavaScript dependencies from the lockfile:
 
 ```powershell
-npm install
+npm ci
 ```
 
 Run the frontend only:
@@ -129,6 +133,53 @@ Build Windows installers and the release executable:
 ```powershell
 npm run tauri:build
 ```
+
+## JavaScript Dependency Locking
+
+The repository commits `package-lock.json` and pins direct JavaScript package
+versions in `package.json`. This is intentional. Fresh installs should use
+`npm ci`, which installs the exact package versions and integrity hashes from
+the lockfile instead of resolving new package versions from npm.
+
+This reduces supply-chain risk for distributed builds. npm packages can be
+compromised after a project is working, including through maintainer account
+compromise or malicious transitive releases. Locked installs do not make npm
+perfectly safe, but they prevent accidental silent upgrades during normal
+development and CI.
+
+Direct runtime dependencies:
+
+- `@tauri-apps/api` `2.11.0`: frontend API bridge into the Tauri shell.
+- `@tauri-apps/plugin-dialog` `2.7.1`: native image/folder picker support.
+- `@tauri-apps/plugin-opener` `2.5.4`: opens model/package folders and reports.
+- `lucide-react` `0.468.0`: UI icons.
+- `react` `18.3.1`: app UI framework.
+- `react-dom` `18.3.1`: React DOM renderer.
+
+Direct development dependencies:
+
+- `@tauri-apps/cli` `2.11.2`: Tauri dev/build command.
+- `@types/react` `18.3.28`: React TypeScript types.
+- `@types/react-dom` `18.3.7`: React DOM TypeScript types.
+- `@vitejs/plugin-react` `5.1.2`: React support for Vite.
+- `typescript` `5.9.3`: TypeScript compiler.
+- `vite` `7.3.3`: frontend dev server and production bundler.
+
+When intentionally upgrading packages:
+
+1. Update exact versions in `package.json`.
+2. Run `npm install` to refresh `package-lock.json`.
+3. Run `npm audit`.
+4. Run `npm run build`.
+5. Run `npm run tauri:build`.
+6. Review and commit both `package.json` and `package-lock.json`.
+
+The current locked JavaScript tree has been checked with `npm audit` and reports
+zero known npm advisory vulnerabilities at the time of this update. A targeted
+check for package names involved in recent npm supply-chain incidents found only
+`debug@4.4.3` as a transitive development dependency of Babel through
+`@vitejs/plugin-react`; the known compromised `debug@4.4.2` version is not in
+the lockfile.
 
 ## Runtime Behavior
 
