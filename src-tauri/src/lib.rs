@@ -7,6 +7,7 @@ use std::{
     thread,
 };
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
@@ -135,26 +136,57 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn parse_python_version(output: &str) -> Option<(u32, u32, u32)> {
+    let version = output
+        .split_whitespace()
+        .find(|part| part.chars().next().is_some_and(|ch| ch.is_ascii_digit()))?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn supported_python_version(version: (u32, u32, u32)) -> bool {
+    version.0 == 3 && (10..=12).contains(&version.1)
+}
+
+fn python_version(spec: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = spec.split_whitespace();
+    let executable = parts.next()?;
+    let args: Vec<_> = parts.collect();
+    let mut command = Command::new(executable);
+    command.args(args).arg("--version");
+    hide_command_window(&mut command);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_python_version(&combined)
+}
+
 fn find_python() -> Option<String> {
     let candidates = if cfg!(target_os = "windows") {
-        vec!["py -3", "python", "python3"]
+        vec![
+            "py -3.11", "py -3.12", "py -3.10", "python", "python3", "py -3",
+        ]
     } else {
-        vec!["python3", "python"]
+        vec![
+            "python3.11",
+            "python3.12",
+            "python3.10",
+            "python3",
+            "python",
+        ]
     };
 
     for candidate in candidates {
-        let mut parts = candidate.split_whitespace();
-        let executable = parts.next()?;
-        let args: Vec<_> = parts.collect();
-        let mut command = Command::new(executable);
-        command
-            .args(args)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        hide_command_window(&mut command);
-        let status = command.status();
-        if matches!(status, Ok(status) if status.success()) {
+        if python_version(candidate).is_some_and(supported_python_version) {
             return Some(candidate.to_string());
         }
     }
@@ -273,6 +305,16 @@ fn get_model_status(app: AppHandle) -> Result<Vec<ModelStatus>, String> {
 }
 
 #[tauri::command]
+fn open_model_folder(app: AppHandle) -> Result<(), String> {
+    let models_dir = app_data_dir(&app)?.join("models");
+    fs::create_dir_all(&models_dir)
+        .map_err(|error| format!("Unable to create model folder: {error}"))?;
+    app.opener()
+        .open_path(models_dir.display().to_string(), None::<&str>)
+        .map_err(|error| format!("Unable to open model folder: {error}"))
+}
+
+#[tauri::command]
 fn resolve_inputs(paths: Vec<String>, recursive: bool) -> Vec<String> {
     let mut output = Vec::new();
     for path in paths {
@@ -347,7 +389,8 @@ fn start_depth_job(
         return Err("No input images were provided.".to_string());
     }
 
-    let python = find_python().ok_or_else(|| "Python 3.10+ was not found on PATH.".to_string())?;
+    let python = find_python()
+        .ok_or_else(|| "Python 3.10, 3.11, or 3.12 was not found on PATH.".to_string())?;
     let worker = worker_path(&app)?;
     let app_data = app_data_dir(&app)?;
     let jobs_dir = app_data.join("jobs");
@@ -431,7 +474,8 @@ fn start_depth_job(
 
 #[tauri::command]
 fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> {
-    let python = find_python().ok_or_else(|| "Python 3.10+ was not found on PATH.".to_string())?;
+    let python = find_python()
+        .ok_or_else(|| "Python 3.10, 3.11, or 3.12 was not found on PATH.".to_string())?;
     let worker = worker_path(&app)?;
     let app_data = app_data_dir(&app)?;
     let jobs_dir = app_data.join("jobs");
@@ -536,6 +580,7 @@ pub fn run() {
             get_model_status,
             get_vram_status,
             download_model,
+            open_model_folder,
             resolve_inputs,
             start_depth_job
         ])

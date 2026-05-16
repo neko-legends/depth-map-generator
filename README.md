@@ -34,7 +34,7 @@ Prerequisites:
 
 - Node.js 20+
 - Rust toolchain for Tauri builds
-- Python 3.10+
+- Python 3.10, 3.11, or 3.12
 - Git
 
 ## AI Agent Installation
@@ -100,6 +100,8 @@ Runtime notes for agents:
 - WebP-only runs install Pillow in the app-managed Python environment.
 - Depth runs install the ML stack, Depth Anything 3, and the selected Hugging
   Face model.
+- Python 3.13+ is not selected for the app-managed environment because some ML
+  dependencies may not publish compatible wheels yet.
 - NVIDIA VRAM display depends on `nvidia-smi`; it is allowed to show unavailable
   on machines without NVIDIA drivers.
 
@@ -134,10 +136,15 @@ Choosing Later skips the download. If depth generation is later started with no
 selected model installed, the worker downloads that model before inference and
 shows download progress in the UI.
 
-The first WebP or depth run creates a Python virtual environment in the app data
-folder. WebP-only runs install only Pillow. Depth-map runs install the ML
-runtime, install Depth Anything 3 from GitHub, and download the selected
-Hugging Face model when needed.
+The first WebP or depth run creates an app-managed Python virtual environment in
+the app data folder. It is separate from project `.venv` folders and avoids
+mixing with custom Python environments used by other projects. The launcher
+prefers Python 3.11, 3.12, or 3.10 and will not use Python 3.13+ for the managed
+environment.
+
+WebP-only runs install only Pillow. Depth-map runs install the ML runtime,
+install Depth Anything 3 from GitHub, and download the selected Hugging Face
+model when needed.
 
 The repository does not include model weights, generated images, installers, or
 local Python environments.

@@ -503,6 +503,19 @@ function App() {
     }
   };
 
+  const openModelFolder = async () => {
+    if (!isTauriRuntime()) {
+      pushLog("Opening the model folder requires the Tauri desktop shell.");
+      return;
+    }
+    try {
+      await invoke("open_model_folder");
+      pushLog("Opened model install folder.");
+    } catch (error) {
+      pushLog(`Could not open model folder: ${String(error)}`);
+    }
+  };
+
   const start = async () => {
     if (!isTauriRuntime()) {
       pushLog("Generation requires the Tauri desktop shell.");
@@ -735,7 +748,7 @@ function App() {
           {runtime?.pythonFound ? (
             <p className="ok">Python: {runtime.pythonCommand}</p>
           ) : (
-            <p className="warn">Python 3.10+ not found on PATH.</p>
+            <p className="warn">Python 3.10, 3.11, or 3.12 not found on PATH.</p>
           )}
           <label className="field runtime-model">
             <span>Depth model</span>
@@ -760,6 +773,10 @@ function App() {
                 ? `${modelName(options.modelRepo)} is installed.`
                 : `${modelName(options.modelRepo)} downloads when needed.`}
           </p>
+          <button className="secondary folder-button" onClick={openModelFolder}>
+            <FolderOpen size={16} />
+            Model folder
+          </button>
           </section>
         </aside>
 

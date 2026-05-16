@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import platform
+import re
+import shutil
 import subprocess
 import sys
 import venv
@@ -19,6 +21,7 @@ MODEL_SIZES = {
     "depth-anything/DA3-SMALL": 137_000_000,
 }
 MODEL_SIDE_FILES = (".gitattributes", "README.md", "config.json")
+PYTHON_VERSION_RE = re.compile(r"Python\s+(\d+)\.(\d+)\.(\d+)")
 
 
 def emit(event_type: str, message: str | None = None, **payload: Any) -> None:
@@ -35,8 +38,23 @@ def venv_python(env_dir: Path) -> Path:
     return env_dir / "bin" / "python"
 
 
+def sanitize_installer_line(line: str) -> str | None:
+    if line.startswith("Collecting "):
+        package = line.removeprefix("Collecting ").split()[0]
+        return f"Resolving dependency: {package}"
+    if line.startswith("Downloading "):
+        return "Downloading dependency packages"
+    if line.startswith("Installing collected packages"):
+        return "Installing dependency packages"
+    if line.startswith("Successfully installed"):
+        return "Dependency install step finished"
+    if line.startswith("ERROR:") or " error:" in line.lower() or "failed" in line.lower():
+        return line
+    return None
+
+
 def run_checked(command: list[str], message: str) -> None:
-    emit("setup", message)
+    emit("setup", f"{message}. This can take several minutes.")
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -46,20 +64,67 @@ def run_checked(command: list[str], message: str) -> None:
         errors="replace",
     )
     assert process.stdout is not None
+    tail: list[str] = []
+    last_status: str | None = None
     for line in process.stdout:
         line = line.strip()
         if line:
-            emit("setup", line)
+            tail.append(line)
+            tail = tail[-18:]
+            status = sanitize_installer_line(line)
+            if status and status != last_status:
+                emit("setup", status)
+                last_status = status
     code = process.wait()
     if code != 0:
-        raise RuntimeError(f"Command failed with exit code {code}: {' '.join(command)}")
+        details = "\n".join(tail) if tail else "No installer output was captured."
+        raise RuntimeError(
+            f"{message} failed. The app uses its own virtual environment, but it needs "
+            f"a compatible system Python to create it. Install Python 3.10, 3.11, or 3.12 "
+            f"and make it available on PATH, then try again.\n\nLast installer output:\n{details}"
+        )
+
+
+def parse_python_version(text: str) -> tuple[int, int, int] | None:
+    match = PYTHON_VERSION_RE.search(text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def supported_python_version(version: tuple[int, int, int] | None) -> bool:
+    return bool(version and version[0] == 3 and 10 <= version[1] <= 12)
+
+
+def python_version(python_path: Path) -> tuple[int, int, int] | None:
+    try:
+        output = subprocess.check_output(
+            [str(python_path), "--version"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        return None
+    return parse_python_version(output)
 
 
 def ensure_env(env_dir: Path, need_depth: bool) -> Path:
     python_path = venv_python(env_dir)
+    if python_path.exists() and not supported_python_version(python_version(python_path)):
+        emit("setup", "Recreating app Python environment with a supported Python version")
+        shutil.rmtree(env_dir, ignore_errors=True)
+
     if not python_path.exists():
         emit("setup", f"Creating Python environment: {env_dir}")
         venv.EnvBuilder(with_pip=True).create(env_dir)
+
+    if not supported_python_version(python_version(python_path)):
+        raise RuntimeError(
+            "DepthMap AI Generator requires Python 3.10, 3.11, or 3.12 for the app-managed "
+            "virtual environment."
+        )
 
     webp_marker = env_dir / ".depthmapai-webp-ready"
     depth_marker = env_dir / ".depthmapai-depth-ready"
@@ -83,6 +148,7 @@ def ensure_env(env_dir: Path, need_depth: bool) -> Path:
                 "torch>=2",
                 "torchvision",
                 "huggingface_hub",
+                "requests",
                 "numpy<2",
                 "pillow",
                 "opencv-python",
