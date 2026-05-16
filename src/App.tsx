@@ -81,7 +81,7 @@ type DepthOptions = {
 
 type QueueItem = {
   path: string;
-  outputPath?: string;
+  outputHistory?: string[];
   status: QueueStatus;
   message?: string;
 };
@@ -259,11 +259,19 @@ function formatBytes(bytes: number) {
   return `${Math.round(bytes / (1024 * 1024))} MB`;
 }
 
-function previewOutputPath(outputPath?: string) {
-  return outputPath
+function parseOutputPaths(output?: string) {
+  return output
     ?.split(";")
     .map((path) => path.trim())
-    .find((path) => /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(path));
+    .filter(Boolean) ?? [];
+}
+
+function isPreviewableImage(path: string) {
+  return /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(path);
+}
+
+function previewOutputPath(paths?: string[]) {
+  return paths?.find(isPreviewableImage);
 }
 
 function compactPath(path: string) {
@@ -286,6 +294,7 @@ function App() {
   const [dragging, setDragging] = useState(false);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [previewImages, setPreviewImages] = useState<PreviewImages>({});
+  const [outputPreviews, setOutputPreviews] = useState<Record<string, string>>({});
   const [modelStatuses, setModelStatuses] = useState<Partial<Record<ModelRepo, ModelStatus>>>({});
   const [showModelPrompt, setShowModelPrompt] = useState(false);
   const [downloadingModel, setDownloadingModel] = useState<ModelRepo | null>(null);
@@ -306,7 +315,7 @@ function App() {
     () => queue.find((item) => item.path === selectedPath) ?? queue[0],
     [queue, selectedPath]
   );
-  const previewOutput = previewOutputPath(selectedItem?.outputPath);
+  const previewOutput = previewOutputPath(selectedItem?.outputHistory);
 
   const pushLog = useCallback((line: string) => {
     setLog((current) => [line, ...current].slice(0, 80));
@@ -319,6 +328,37 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(options));
   }, [options]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    const imagePaths = Array.from(
+      new Set(queue.flatMap((item) => item.outputHistory ?? []).filter(isPreviewableImage))
+    );
+    const missing = imagePaths.filter((path) => outputPreviews[path] === undefined);
+    if (missing.length === 0) return;
+
+    let canceled = false;
+    const loadOutputPreviews = async () => {
+      const loaded: Record<string, string> = {};
+      await Promise.all(
+        missing.map(async (path) => {
+          try {
+            loaded[path] = await invoke<string>("preview_image_data_url", { path });
+          } catch {
+            loaded[path] = "";
+          }
+        })
+      );
+      if (!canceled && Object.keys(loaded).length > 0) {
+        setOutputPreviews((current) => ({ ...current, ...loaded }));
+      }
+    };
+
+    void loadOutputPreviews();
+    return () => {
+      canceled = true;
+    };
+  }, [outputPreviews, queue]);
 
   useEffect(() => {
     if (!selectedItem || !isTauriRuntime()) {
@@ -524,15 +564,32 @@ function App() {
       }
 
       if (payload.type === "image_done" && payload.path) {
+        const outputPaths = parseOutputPaths(payload.output);
+        if (outputPaths.length > 0) {
+          setOutputPreviews((current) => {
+            const next = { ...current };
+            outputPaths.forEach((path) => {
+              delete next[path];
+            });
+            return next;
+          });
+        }
         setQueue((current) =>
           current.map((item) =>
             item.path === payload.path
-              ? {
-                  ...item,
-                  status: "done",
-                  outputPath: payload.output,
-                  message: "Saved"
-                }
+              ? (() => {
+                  const previous = item.outputHistory ?? [];
+                  const merged = [
+                    ...outputPaths,
+                    ...previous.filter((path) => !outputPaths.includes(path))
+                  ];
+                  return {
+                    ...item,
+                    status: "done",
+                    outputHistory: merged,
+                    message: outputPaths.length > 0 ? `${merged.length} output${merged.length === 1 ? "" : "s"}` : "Saved"
+                  };
+                })()
               : item
           )
         );
@@ -714,6 +771,18 @@ function App() {
     pushLog("Output folder reset to source folders.");
   };
 
+  const openContainingFolder = async (path: string) => {
+    if (!isTauriRuntime()) {
+      pushLog("Opening folders requires the Tauri desktop shell.");
+      return;
+    }
+    try {
+      await invoke("open_containing_folder", { path });
+    } catch (error) {
+      pushLog(`Could not open folder: ${String(error)}`);
+    }
+  };
+
   const openModelFolder = async () => {
     if (!isTauriRuntime()) {
       pushLog("Opening the model folder requires the Tauri desktop shell.");
@@ -797,7 +866,7 @@ function App() {
     setQueue((current) =>
       current.map((item) =>
         runnablePaths.includes(item.path)
-          ? { ...item, status: "pending", outputPath: undefined, message: undefined }
+          ? { ...item, status: "pending", message: undefined }
           : item
       )
     );
@@ -827,6 +896,7 @@ function App() {
 
   const reset = () => {
     setQueue([]);
+    setOutputPreviews({});
     setLog([]);
     setSelectedPath(null);
     setHeadline("Drop images or folders");
@@ -1325,12 +1395,14 @@ function App() {
             </div>
           ) : (
             queue.map((item) => (
-              <button
+              <div
                 className={`queue-row ${item.status} ${selectedItem?.path === item.path ? "selected" : ""}`}
                 key={item.path}
                 onClick={() => setSelectedPath(item.path)}
+                role="button"
+                tabIndex={0}
               >
-                <div>
+                <div className="queue-input">
                   <strong>{fileName(item.path)}</strong>
                   <small>{item.path}</small>
                 </div>
@@ -1338,8 +1410,44 @@ function App() {
                   {statusIcon(item.status)}
                   {item.message ?? item.status}
                 </div>
-                <small>{item.outputPath ?? "-"}</small>
-              </button>
+                <div className="output-history">
+                  {(item.outputHistory?.length ?? 0) > 0 ? (
+                    <>
+                      <div className="output-thumbs">
+                        {item.outputHistory?.map((path) => (
+                          <button
+                            className={`output-thumb ${isPreviewableImage(path) ? "" : "file-output"}`}
+                            key={path}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setSelectedPath(item.path);
+                            }}
+                            title={path}
+                          >
+                            {isPreviewableImage(path) && outputPreviews[path] ? (
+                              <img src={outputPreviews[path]} alt="" />
+                            ) : (
+                              <span>{fileName(path).split(".").pop()?.toUpperCase() ?? "FILE"}</span>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        className="secondary icon output-folder"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void openContainingFolder(item.outputHistory?.[0] ?? item.path);
+                        }}
+                        title="Open output folder"
+                      >
+                        <FolderOpen size={15} />
+                      </button>
+                    </>
+                  ) : (
+                    <span className="output-empty">No outputs yet</span>
+                  )}
+                </div>
+              </div>
             ))
           )}
         </section>

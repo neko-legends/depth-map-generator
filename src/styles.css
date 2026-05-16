@@ -578,14 +578,15 @@ button:disabled {
 .queue {
   flex: 1;
   min-height: 0;
+  overflow: auto;
 }
 
 .queue-header,
 .queue-row {
   display: grid;
-  grid-template-columns: minmax(260px, 1.3fr) 160px minmax(240px, 1fr);
+  grid-template-columns: minmax(260px, 1fr) 150px minmax(420px, 1.8fr);
   gap: 16px;
-  align-items: center;
+  align-items: start;
   padding: 13px 16px;
 }
 
@@ -612,6 +613,10 @@ button:disabled {
 
 .queue-row.selected {
   background: rgba(255, 138, 42, 0.1);
+}
+
+.queue-input {
+  min-width: 0;
 }
 
 .queue-row strong {
@@ -647,8 +652,65 @@ button:disabled {
   display: flex;
   gap: 8px;
   align-items: center;
+  min-height: 50px;
   color: #cbb9a9;
   font-weight: 800;
+}
+
+.output-history {
+  display: grid;
+  grid-template-columns: 1fr 42px;
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+}
+
+.output-thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.output-thumb {
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 54px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 138, 42, 0.22);
+  border-radius: 7px;
+  background: rgba(8, 7, 6, 0.88);
+  cursor: pointer;
+}
+
+.output-thumb img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.output-thumb span,
+.output-empty {
+  color: #a89788;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.file-output {
+  background: rgba(255, 138, 42, 0.08);
+}
+
+.output-folder {
+  width: 38px;
+  min-height: 38px;
+  padding: 0;
+}
+
+.output-empty {
+  display: block;
+  padding-top: 16px;
 }
 
 .empty {
@@ -675,21 +737,25 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.queue::-webkit-scrollbar,
 .log::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 
+.queue::-webkit-scrollbar-track,
 .log::-webkit-scrollbar-track {
   background: rgba(13, 11, 9, 0.9);
 }
 
+.queue::-webkit-scrollbar-thumb,
 .log::-webkit-scrollbar-thumb {
   border: 2px solid rgba(13, 11, 9, 0.9);
   border-radius: 999px;
   background: rgba(255, 138, 42, 0.58);
 }
 
+.queue,
 .log {
   scrollbar-color: rgba(255, 138, 42, 0.58) rgba(13, 11, 9, 0.9);
 }

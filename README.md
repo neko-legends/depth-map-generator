@@ -23,6 +23,8 @@ download, depth map export, and WebP conversion.
 - JPG-style inputs use configurable WebP quality.
 - Existing outputs get numbered filenames such as `_depth_2.png` when overwrite
   is off.
+- The queue keeps output history per source image and shows recent output
+  thumbnails first, so tuning changes can be compared without leaving the app.
 - Model selector:
   - `depth-anything/DA3-LARGE-1.1` by default.
   - `depth-anything/DA3-SMALL` for lower VRAM machines.
@@ -196,6 +198,10 @@ By default, outputs are written beside each source image. The Settings panel can
 choose a single output folder instead. When overwrite is off and a target output
 already exists, the worker writes the next available numbered filename instead
 of replacing or skipping the file, for example `image_depth_2.png`.
+
+Each queued source image keeps an in-session output history. New outputs appear
+first as thumbnails in the Outputs column. Use the folder button on a row to open
+the folder containing the newest output.
 
 The Cancel button stops the active Python worker process tree. A canceled model
 download may leave an incomplete temporary download file, which is replaced on

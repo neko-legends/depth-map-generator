@@ -12,10 +12,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "jfif", "jpf", "jp2", "j2k", "webp", "bmp", "tif", "tiff",
@@ -314,7 +314,9 @@ fn kill_process_tree(pid: u32) -> Result<(), String> {
         Ok(output) => {
             #[cfg(not(target_os = "windows"))]
             {
-                let fallback = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+                let fallback = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .output();
                 if matches!(fallback, Ok(output) if output.status.success()) {
                     return Ok(());
                 }
@@ -529,6 +531,25 @@ Model files are downloaded separately from:
     app.opener()
         .open_path(report_path.display().to_string(), None::<&str>)
         .map_err(|error| format!("Unable to open package report: {error}"))
+}
+
+#[tauri::command]
+fn open_containing_folder(app: AppHandle, path: String) -> Result<(), String> {
+    let requested_path = PathBuf::from(path);
+    let folder = if requested_path.is_dir() {
+        requested_path
+    } else {
+        requested_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "Unable to resolve containing folder.".to_string())?
+    };
+    if !folder.is_dir() {
+        return Err(format!("Folder does not exist: {}", folder.display()));
+    }
+    app.opener()
+        .open_path(folder.display().to_string(), None::<&str>)
+        .map_err(|error| format!("Unable to open folder: {error}"))
 }
 
 #[tauri::command]
@@ -876,6 +897,7 @@ pub fn run() {
             download_model,
             open_model_folder,
             open_package_report,
+            open_containing_folder,
             preview_image_data_url,
             resolve_inputs,
             start_depth_job
