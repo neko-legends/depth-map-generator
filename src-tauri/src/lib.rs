@@ -376,7 +376,7 @@ WebP conversion:
 python -m pip install pillow
 
 Depth generation:
-python -m pip install torch>=2 torchvision huggingface_hub requests numpy<2 pillow opencv-python safetensors
+python -m pip install torch>=2 torchvision huggingface_hub requests numpy<2 pillow opencv-python safetensors addict
 python -m pip install git+https://github.com/ByteDance-Seed/depth-anything-3.git
 
 Model files are downloaded separately from:

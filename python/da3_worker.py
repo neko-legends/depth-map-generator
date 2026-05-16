@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 
 DEFAULT_MODEL_REPO = "depth-anything/DA3-LARGE-1.1"
 DA3_REPO = "git+https://github.com/ByteDance-Seed/depth-anything-3.git"
+DEPTH_DEPS_MARKER = ".depthmapai-depth-deps-v2-ready"
 MODEL_SIZES = {
     "depth-anything/DA3-LARGE-1.1": 1_643_843_860,
     "depth-anything/DA3-SMALL": 137_000_000,
@@ -128,11 +129,14 @@ def ensure_env(env_dir: Path, need_depth: bool) -> Path:
 
     webp_marker = env_dir / ".depthmapai-webp-ready"
     depth_marker = env_dir / ".depthmapai-depth-ready"
+    depth_deps_marker = env_dir / DEPTH_DEPS_MARKER
     old_marker = env_dir / ".depthmapai-ready"
     if old_marker.exists():
         webp_marker.write_text("ok\n", encoding="utf-8")
         depth_marker.write_text("ok\n", encoding="utf-8")
-    if webp_marker.exists() and (not need_depth or depth_marker.exists()):
+    if webp_marker.exists() and (
+        not need_depth or (depth_marker.exists() and depth_deps_marker.exists())
+    ):
         return python_path
 
     pip = [str(python_path), "-m", "pip"]
@@ -140,7 +144,7 @@ def ensure_env(env_dir: Path, need_depth: bool) -> Path:
     if not webp_marker.exists():
         run_checked(pip + ["install", "pillow"], "Installing WebP conversion package")
         webp_marker.write_text("ok\n", encoding="utf-8")
-    if need_depth and not depth_marker.exists():
+    if need_depth and not depth_deps_marker.exists():
         run_checked(
             pip
             + [
@@ -153,11 +157,13 @@ def ensure_env(env_dir: Path, need_depth: bool) -> Path:
                 "pillow",
                 "opencv-python",
                 "safetensors",
+                "addict",
             ],
             "Installing ML runtime packages",
         )
         run_checked(pip + ["install", DA3_REPO], "Installing Depth Anything 3")
         depth_marker.write_text("ok\n", encoding="utf-8")
+        depth_deps_marker.write_text("ok\n", encoding="utf-8")
     return python_path
 
 

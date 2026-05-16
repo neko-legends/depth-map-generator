@@ -151,6 +151,9 @@ The Runtime panel can open `package-report.txt` in the app data folder. That
 report lists the direct install commands and, after setup has run, the exact
 packages currently installed in the app-managed Python environment.
 
+The app also installs `addict` because DA3 imports it in model/runtime modules
+but it is not currently listed in DA3's project dependency metadata.
+
 The repository does not include model weights, generated images, installers, or
 local Python environments.
 
