@@ -24,6 +24,7 @@ download, depth map export, and WebP conversion.
   - `depth-anything/DA3-SMALL` for lower VRAM machines.
 - First-launch model picker with Later option.
 - Model download progress with percent and downloaded size.
+- Buttons to open the model install folder and package report.
 - Device selector: Auto, CUDA, Apple MPS, CPU.
 - NVIDIA VRAM usage display when `nvidia-smi` is available.
 - Orange/black scalable 16:9 UI.
@@ -145,6 +146,10 @@ environment.
 WebP-only runs install only Pillow. Depth-map runs install the ML runtime,
 install Depth Anything 3 from GitHub, and download the selected Hugging Face
 model when needed.
+
+The Runtime panel can open `package-report.txt` in the app data folder. That
+report lists the direct install commands and, after setup has run, the exact
+packages currently installed in the app-managed Python environment.
 
 The repository does not include model weights, generated images, installers, or
 local Python environments.

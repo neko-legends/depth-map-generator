@@ -9,6 +9,7 @@ import {
   FolderOpen,
   Image,
   Loader2,
+  Package,
   Play,
   RotateCcw,
   Settings2,
@@ -516,6 +517,19 @@ function App() {
     }
   };
 
+  const openPackageReport = async () => {
+    if (!isTauriRuntime()) {
+      pushLog("Opening the package report requires the Tauri desktop shell.");
+      return;
+    }
+    try {
+      await invoke("open_package_report");
+      pushLog("Opened package report.");
+    } catch (error) {
+      pushLog(`Could not open package report: ${String(error)}`);
+    }
+  };
+
   const start = async () => {
     if (!isTauriRuntime()) {
       pushLog("Generation requires the Tauri desktop shell.");
@@ -776,6 +790,10 @@ function App() {
           <button className="secondary folder-button" onClick={openModelFolder}>
             <FolderOpen size={16} />
             Model folder
+          </button>
+          <button className="secondary folder-button" onClick={openPackageReport}>
+            <Package size={16} />
+            Packages
           </button>
           </section>
         </aside>

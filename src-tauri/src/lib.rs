@@ -211,6 +211,38 @@ fn command_from_python_spec(spec: &str) -> Command {
     command
 }
 
+fn managed_python_path(env_dir: &Path) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        env_dir.join("Scripts").join("python.exe")
+    } else {
+        env_dir.join("bin").join("python")
+    }
+}
+
+fn installed_packages_report(env_dir: &Path) -> String {
+    let python_path = managed_python_path(env_dir);
+    if !python_path.exists() {
+        return "Installed packages: app-managed Python environment has not been created yet.\n"
+            .to_string();
+    }
+
+    let mut command = Command::new(python_path);
+    command.args(["-m", "pip", "freeze", "--all"]);
+    hide_command_window(&mut command);
+
+    match command.output() {
+        Ok(output) if output.status.success() => format!(
+            "Installed packages from app-managed environment:\n\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        ),
+        Ok(output) => format!(
+            "Installed packages: unable to read pip freeze.\n\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => format!("Installed packages: unable to run pip freeze: {error}\n"),
+    }
+}
+
 fn is_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -312,6 +344,57 @@ fn open_model_folder(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(models_dir.display().to_string(), None::<&str>)
         .map_err(|error| format!("Unable to open model folder: {error}"))
+}
+
+#[tauri::command]
+fn open_package_report(app: AppHandle) -> Result<(), String> {
+    let app_data = app_data_dir(&app)?;
+    let env_dir = app_data.join("python-env");
+    let report_path = app_data.join("package-report.txt");
+    let report = format!(
+        "\
+DepthMap AI Generator package report
+====================================
+
+This file lists the Python packages this app installs into its own app-managed
+virtual environment, plus the currently installed package versions when that
+environment exists.
+
+App data folder:
+{app_data}
+
+Managed Python environment:
+{env_dir}
+
+Direct install commands used by the app
+---------------------------------------
+
+Base setup:
+python -m pip install --upgrade pip setuptools wheel
+
+WebP conversion:
+python -m pip install pillow
+
+Depth generation:
+python -m pip install torch>=2 torchvision huggingface_hub requests numpy<2 pillow opencv-python safetensors
+python -m pip install git+https://github.com/ByteDance-Seed/depth-anything-3.git
+
+Model files are downloaded separately from:
+- https://huggingface.co/depth-anything/DA3-LARGE-1.1
+- https://huggingface.co/depth-anything/DA3-SMALL
+
+{installed}
+",
+        app_data = app_data.display(),
+        env_dir = env_dir.display(),
+        installed = installed_packages_report(&env_dir)
+    );
+
+    fs::write(&report_path, report)
+        .map_err(|error| format!("Unable to write package report: {error}"))?;
+    app.opener()
+        .open_path(report_path.display().to_string(), None::<&str>)
+        .map_err(|error| format!("Unable to open package report: {error}"))
 }
 
 #[tauri::command]
@@ -581,6 +664,7 @@ pub fn run() {
             get_vram_status,
             download_model,
             open_model_folder,
+            open_package_report,
             resolve_inputs,
             start_depth_job
         ])
