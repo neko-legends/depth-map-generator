@@ -35,6 +35,72 @@ Prerequisites:
 - Python 3.10+
 - Git
 
+## AI Agent Installation
+
+Use these steps when installing or validating the app from an automated coding
+agent.
+
+1. Clone the repository.
+
+```powershell
+git clone https://github.com/flashosophy/DepthMapAIGenerator.git
+cd DepthMapAIGenerator
+```
+
+2. Confirm required tools are available.
+
+```powershell
+node --version
+npm --version
+python --version
+cargo --version
+rustc --version
+```
+
+3. Install JavaScript dependencies.
+
+```powershell
+npm install
+```
+
+4. Run source checks.
+
+```powershell
+npm run build
+python -m py_compile python\da3_worker.py
+```
+
+5. Start the desktop app in development mode.
+
+```powershell
+npm run tauri:dev
+```
+
+6. Build release artifacts.
+
+```powershell
+npm run tauri:build
+```
+
+Expected Windows outputs:
+
+- `src-tauri\target\release\depth-map-ai-generator.exe`
+- `src-tauri\target\release\bundle\nsis\DepthMap AI Generator_0.1.0_x64-setup.exe`
+- `src-tauri\target\release\bundle\msi\DepthMap AI Generator_0.1.0_x64_en-US.msi`
+
+Runtime notes for agents:
+
+- Do not commit `node_modules`, `dist`, `dist-portable`, `src-tauri/target`, model
+  folders, app-data Python environments, generated depth maps, or installer
+  files.
+- The app downloads model weights at runtime. Do not add Hugging Face model
+  files to the repository.
+- WebP-only runs install Pillow in the app-managed Python environment.
+- Depth runs install the ML stack, Depth Anything 3, and the selected Hugging
+  Face model.
+- NVIDIA VRAM display depends on `nvidia-smi`; it is allowed to show unavailable
+  on machines without NVIDIA drivers.
+
 Install JavaScript dependencies:
 
 ```powershell
