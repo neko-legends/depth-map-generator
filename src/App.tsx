@@ -784,28 +784,38 @@ function App() {
             </label>
           </div>
 
-          <div className="triple-fields">
-            <label className="field">
-              <span>Black</span>
+          <div className="range-field">
+            <div className="range-labels">
+              <span>Depth window</span>
+              <strong>
+                {options.normalizeLow.toFixed(1)} - {options.normalizeHigh.toFixed(1)}
+              </strong>
+            </div>
+            <div
+              className="dual-range"
+              style={
+                {
+                  "--range-low": `${options.normalizeLow}%`,
+                  "--range-high": `${options.normalizeHigh}%`
+                } as React.CSSProperties
+              }
+            >
               <input
-                type="number"
+                type="range"
                 min="0"
-                max="98"
+                max="99"
                 step="0.5"
                 disabled={!options.generateDepth}
                 value={options.normalizeLow}
                 onChange={(event) =>
                   setOptions((current) => ({
                     ...current,
-                    normalizeLow: Math.min(Number(event.target.value) || 0, current.normalizeHigh - 0.5)
+                    normalizeLow: Math.min(Number(event.target.value), current.normalizeHigh - 0.5)
                   }))
                 }
               />
-            </label>
-            <label className="field">
-              <span>White</span>
               <input
-                type="number"
+                type="range"
                 min="1"
                 max="100"
                 step="0.5"
@@ -814,15 +824,18 @@ function App() {
                 onChange={(event) =>
                   setOptions((current) => ({
                     ...current,
-                    normalizeHigh: Math.max(Number(event.target.value) || 100, current.normalizeLow + 0.5)
+                    normalizeHigh: Math.max(Number(event.target.value), current.normalizeLow + 0.5)
                   }))
                 }
               />
-            </label>
+            </div>
+          </div>
+
+          <div className="single-field">
             <label className="field">
               <span>Gamma</span>
               <input
-                type="number"
+                type="range"
                 min="0.2"
                 max="4"
                 step="0.1"
@@ -835,6 +848,7 @@ function App() {
                   }))
                 }
               />
+              <strong>{options.depthGamma.toFixed(1)}</strong>
             </label>
           </div>
 
