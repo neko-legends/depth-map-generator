@@ -95,7 +95,7 @@ const defaultOptions: DepthOptions = {
 };
 
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
-const isTauriRuntime = () => "__TAURI_INTERNALS__" in window;
+const isTauriRuntime = () => "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
 
 function statusIcon(status: QueueStatus) {
   if (status === "running") return <Loader2 className="spin" size={16} />;
@@ -177,10 +177,17 @@ function App() {
 
   const resolvePaths = useCallback(
     async (paths: string[]) => {
-      const resolved = await invoke<string[]>("resolve_inputs", {
-        paths,
-        recursive: options.recursive
-      });
+      if (paths.length === 0) return;
+      let resolved: string[];
+      try {
+        resolved = await invoke<string[]>("resolve_inputs", {
+          paths,
+          recursive: options.recursive
+        });
+      } catch (error) {
+        pushLog(`Could not read dropped/selected paths: ${String(error)}`);
+        return;
+      }
       setQueue((current) => {
         const known = new Set(current.map((item) => item.path));
         const additions = resolved
@@ -267,6 +274,7 @@ function App() {
       }
       if (event.payload.type === "drop") {
         setDragging(false);
+        pushLog(`Dropped ${event.payload.paths.length} item${event.payload.paths.length === 1 ? "" : "s"}.`);
         void resolvePaths(event.payload.paths);
       }
       if (event.payload.type === "leave") {
@@ -321,20 +329,28 @@ function App() {
       pushLog("File picking requires the Tauri desktop shell.");
       return;
     }
-    const selected = await open({
-      multiple: true,
-      directory: false,
-      filters: [
-        {
-          name: "Images",
-          extensions: ["png", "jpg", "jpeg", "jpe", "jfif", "jpf", "jp2", "j2k", "webp", "bmp", "tif", "tiff"]
-        }
-      ]
-    });
+    let selected: string | string[] | null;
+    try {
+      selected = await open({
+        multiple: true,
+        directory: false,
+        filters: [
+          {
+            name: "Images",
+            extensions: ["png", "jpg", "jpeg", "jpe", "jfif", "jpf", "jp2", "j2k", "webp", "bmp", "tif", "tiff"]
+          }
+        ]
+      });
+    } catch (error) {
+      pushLog(`Image picker failed: ${String(error)}`);
+      return;
+    }
     if (Array.isArray(selected)) {
       await resolvePaths(selected);
     } else if (typeof selected === "string") {
       await resolvePaths([selected]);
+    } else {
+      pushLog("Image picker canceled.");
     }
   };
 
@@ -343,11 +359,19 @@ function App() {
       pushLog("Folder picking requires the Tauri desktop shell.");
       return;
     }
-    const selected = await open({ multiple: true, directory: true });
+    let selected: string | string[] | null;
+    try {
+      selected = await open({ multiple: true, directory: true });
+    } catch (error) {
+      pushLog(`Folder picker failed: ${String(error)}`);
+      return;
+    }
     if (Array.isArray(selected)) {
       await resolvePaths(selected);
     } else if (typeof selected === "string") {
       await resolvePaths([selected]);
+    } else {
+      pushLog("Folder picker canceled.");
     }
   };
 
