@@ -14,6 +14,11 @@ from tempfile import TemporaryDirectory
 
 DEFAULT_MODEL_REPO = "depth-anything/DA3-LARGE-1.1"
 DA3_REPO = "git+https://github.com/ByteDance-Seed/depth-anything-3.git"
+MODEL_SIZES = {
+    "depth-anything/DA3-LARGE-1.1": 1_643_843_860,
+    "depth-anything/DA3-SMALL": 137_000_000,
+}
+MODEL_SIDE_FILES = (".gitattributes", "README.md", "config.json")
 
 
 def emit(event_type: str, message: str | None = None, **payload: Any) -> None:
@@ -245,19 +250,82 @@ def save_depth(depth: Any, output_path: Path, output_format: str, invert: bool) 
     image.save(output_path)
 
 
+def emit_download_progress(
+    model_repo: str,
+    downloaded: int,
+    total: int,
+    message: str | None = None,
+) -> None:
+    percent = min(100.0, round((downloaded / total) * 100, 1)) if total > 0 else None
+    emit(
+        "download_progress",
+        message or f"Downloading {model_repo.split('/')[-1]}",
+        modelRepo=model_repo,
+        bytesDownloaded=downloaded,
+        bytesTotal=total,
+        percent=percent,
+    )
+
+
+def download_model_file(model_repo: str, model_dir: Path) -> None:
+    import requests
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_file = model_dir / "model.safetensors"
+    temp_file = model_dir / "model.safetensors.incomplete"
+    expected_size = MODEL_SIZES.get(model_repo, 0)
+    url = f"https://huggingface.co/{model_repo}/resolve/main/model.safetensors?download=true"
+
+    if temp_file.exists():
+        temp_file.unlink()
+
+    emit_download_progress(model_repo, 0, expected_size, f"Downloading {model_repo.split('/')[-1]}")
+    with requests.get(url, stream=True, timeout=60) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("content-length") or expected_size)
+        downloaded = 0
+        next_emit = 0
+        with temp_file.open("wb") as output:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                output.write(chunk)
+                downloaded += len(chunk)
+                if downloaded >= next_emit or downloaded == total:
+                    emit_download_progress(model_repo, downloaded, total)
+                    next_emit = downloaded + max(total // 100, 8 * 1024 * 1024)
+
+    actual_size = temp_file.stat().st_size
+    if expected_size and actual_size < expected_size * 0.95:
+        temp_file.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Downloaded model file looks incomplete: {actual_size} bytes of expected {expected_size}."
+        )
+    temp_file.replace(model_file)
+    emit_download_progress(model_repo, actual_size, actual_size, f"Downloaded {model_repo.split('/')[-1]}")
+
+
 def ensure_model(model_repo: str, model_dir: Path) -> Path:
     model_file = model_dir / "model.safetensors"
     if model_file.exists():
+        emit_download_progress(model_repo, model_file.stat().st_size, model_file.stat().st_size, f"{model_repo.split('/')[-1]} already installed")
         return model_dir
 
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download
 
     emit("model", f"Downloading {model_repo}")
-    snapshot_download(
-        repo_id=model_repo,
-        local_dir=str(model_dir),
-        local_dir_use_symlinks=False,
-    )
+    model_dir.mkdir(parents=True, exist_ok=True)
+    for filename in MODEL_SIDE_FILES:
+        try:
+            hf_hub_download(
+                repo_id=model_repo,
+                filename=filename,
+                local_dir=str(model_dir),
+                local_dir_use_symlinks=False,
+            )
+        except Exception as error:  # noqa: BLE001 - sidecar files vary by repo.
+            emit("setup", f"Skipped {filename}: {error}")
+    download_model_file(model_repo, model_dir)
     return model_dir
 
 
@@ -268,6 +336,13 @@ def run_job(job: dict[str, Any]) -> None:
     convert_webp = bool(options.get("convertWebp", False))
     model = None
     torch = None
+    download_only = bool(job.get("download_only", False))
+
+    if download_only:
+        model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
+        ensure_model(model_repo, Path(job["model_dir"]))
+        emit("done", f"{model_repo.split('/')[-1]} is ready.")
+        return
 
     if not generate_depth and not convert_webp:
         raise RuntimeError("No outputs selected. Enable depth generation or WebP conversion.")

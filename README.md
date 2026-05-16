@@ -22,6 +22,8 @@ download, depth map export, and WebP conversion.
 - Model selector:
   - `depth-anything/DA3-LARGE-1.1` by default.
   - `depth-anything/DA3-SMALL` for lower VRAM machines.
+- First-launch model picker with Later option.
+- Model download progress with percent and downloaded size.
 - Device selector: Auto, CUDA, Apple MPS, CPU.
 - NVIDIA VRAM usage display when `nvidia-smi` is available.
 - Orange/black scalable 16:9 UI.
@@ -127,10 +129,15 @@ npm run tauri:build
 
 ## Runtime Behavior
 
-The first generation run creates a Python virtual environment in the app data
+On first launch, the app offers to download either DA3-LARGE-1.1 or DA3-SMALL.
+Choosing Later skips the download. If depth generation is later started with no
+selected model installed, the worker downloads that model before inference and
+shows download progress in the UI.
+
+The first WebP or depth run creates a Python virtual environment in the app data
 folder. WebP-only runs install only Pillow. Depth-map runs install the ML
 runtime, install Depth Anything 3 from GitHub, and download the selected
-Hugging Face model.
+Hugging Face model when needed.
 
 The repository does not include model weights, generated images, installers, or
 local Python environments.

@@ -43,6 +43,14 @@ type VramStatus = {
   message: string;
 };
 
+type ModelStatus = {
+  repo: ModelRepo;
+  name: string;
+  installed: boolean;
+  modelPath: string;
+  sizeBytes: number;
+};
+
 type DepthOptions = {
   device: Device;
   modelRepo: ModelRepo;
@@ -69,6 +77,7 @@ type WorkerEvent = {
   type:
     | "setup"
     | "model"
+    | "download_progress"
     | "image_start"
     | "image_done"
     | "image_error"
@@ -77,6 +86,18 @@ type WorkerEvent = {
   message?: string;
   path?: string;
   output?: string;
+  modelRepo?: ModelRepo;
+  bytesDownloaded?: number;
+  bytesTotal?: number;
+  percent?: number | null;
+};
+
+type DownloadProgress = {
+  modelRepo: ModelRepo;
+  message: string;
+  bytesDownloaded: number;
+  bytesTotal: number;
+  percent: number | null;
 };
 
 const defaultOptions: DepthOptions = {
@@ -92,6 +113,22 @@ const defaultOptions: DepthOptions = {
   suffix: "_depth",
   resizeMode: "none",
   resizeValue: 1024
+};
+
+const MODEL_PROMPT_SEEN_KEY = "depthmapai.modelPromptSeen.v1";
+const MODEL_DETAILS: Record<ModelRepo, { name: string; size: string; vram: string; note: string }> = {
+  "depth-anything/DA3-LARGE-1.1": {
+    name: "DA3-LARGE-1.1",
+    size: "1.64 GB",
+    vram: "Recommended: 8 GB+ VRAM",
+    note: "Best quality default."
+  },
+  "depth-anything/DA3-SMALL": {
+    name: "DA3-SMALL",
+    size: "137 MB",
+    vram: "Recommended: 4 GB+ VRAM",
+    note: "Lower VRAM, faster download."
+  }
 };
 
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
@@ -122,6 +159,12 @@ function modelName(modelRepo: ModelRepo) {
   return modelRepo === "depth-anything/DA3-SMALL" ? "DA3-SMALL" : "DA3-LARGE-1.1";
 }
 
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "--";
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  return `${Math.round(bytes / (1024 * 1024))} MB`;
+}
+
 function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [vram, setVram] = useState<VramStatus | null>(null);
@@ -131,6 +174,10 @@ function App() {
   const [headline, setHeadline] = useState("Drop images or folders");
   const [log, setLog] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [modelStatuses, setModelStatuses] = useState<Partial<Record<ModelRepo, ModelStatus>>>({});
+  const [showModelPrompt, setShowModelPrompt] = useState(false);
+  const [downloadingModel, setDownloadingModel] = useState<ModelRepo | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
 
   const completeCount = useMemo(
     () => queue.filter((item) => item.status === "done").length,
@@ -141,10 +188,58 @@ function App() {
     [queue]
   );
   const vramDisplay = useMemo(() => formatVram(vram), [vram]);
+  const selectedModelStatus = modelStatuses[options.modelRepo];
+  const activeDownload = downloadProgress;
 
   const pushLog = useCallback((line: string) => {
     setLog((current) => [line, ...current].slice(0, 80));
   }, []);
+
+  const refreshModelStatus = useCallback(async () => {
+    if (!isTauriRuntime()) return [] as ModelStatus[];
+    const statuses = await invoke<ModelStatus[]>("get_model_status");
+    setModelStatuses(Object.fromEntries(statuses.map((status) => [status.repo, status])));
+    return statuses;
+  }, []);
+
+  const markModelPromptSeen = useCallback(() => {
+    window.localStorage.setItem(MODEL_PROMPT_SEEN_KEY, "1");
+    setShowModelPrompt(false);
+  }, []);
+
+  const downloadSelectedModel = useCallback(
+    async (modelRepo: ModelRepo, fromPrompt = false) => {
+      if (!isTauriRuntime()) {
+        pushLog("Model downloads require the Tauri desktop shell.");
+        return;
+      }
+      if (busy || downloadingModel) {
+        pushLog("A job is already running.");
+        return;
+      }
+      if (fromPrompt) {
+        markModelPromptSeen();
+      }
+      setOptions((current) => ({ ...current, modelRepo, generateDepth: true }));
+      setDownloadingModel(modelRepo);
+      setDownloadProgress({
+        modelRepo,
+        message: `Preparing ${modelName(modelRepo)}`,
+        bytesDownloaded: 0,
+        bytesTotal: modelStatuses[modelRepo]?.sizeBytes ?? 0,
+        percent: 0
+      });
+      setHeadline(`Preparing ${modelName(modelRepo)} download`);
+      try {
+        await invoke("download_model", { modelRepo });
+      } catch (error) {
+        setDownloadingModel(null);
+        setDownloadProgress(null);
+        pushLog(`Model download failed to start: ${String(error)}`);
+      }
+    },
+    [busy, downloadingModel, markModelPromptSeen, modelStatuses, pushLog]
+  );
 
   useEffect(() => {
     const updateScale = () => {
@@ -174,6 +269,19 @@ function App() {
     const interval = window.setInterval(refreshVram, 2500);
     return () => window.clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    void refreshModelStatus()
+      .then((statuses) => {
+        const promptSeen = window.localStorage.getItem(MODEL_PROMPT_SEEN_KEY) === "1";
+        const anyInstalled = statuses.some((status) => status.installed);
+        if (!promptSeen && !anyInstalled) {
+          setShowModelPrompt(true);
+        }
+      })
+      .catch((error) => pushLog(`Could not read model status: ${String(error)}`));
+  }, [pushLog, refreshModelStatus]);
 
   const resolvePaths = useCallback(
     async (paths: string[]) => {
@@ -224,6 +332,22 @@ function App() {
         pushLog(payload.message);
       }
 
+      if (payload.type === "download_progress" && payload.modelRepo) {
+        const percent = typeof payload.percent === "number" ? payload.percent : null;
+        setDownloadProgress({
+          modelRepo: payload.modelRepo,
+          message: payload.message ?? `Downloading ${modelName(payload.modelRepo)}`,
+          bytesDownloaded: payload.bytesDownloaded ?? 0,
+          bytesTotal: payload.bytesTotal ?? 0,
+          percent
+        });
+        setHeadline(
+          percent === null
+            ? `Downloading ${modelName(payload.modelRepo)}`
+            : `Downloading ${modelName(payload.modelRepo)} ${percent.toFixed(1)}%`
+        );
+      }
+
       if (payload.type === "image_start" && payload.path) {
         setQueue((current) =>
           current.map((item) =>
@@ -265,6 +389,10 @@ function App() {
 
       if (payload.type === "done" || payload.type === "error") {
         setBusy(false);
+        setDownloadingModel(null);
+        void refreshModelStatus().catch((error) =>
+          pushLog(`Could not refresh model status: ${String(error)}`)
+        );
       }
     });
 
@@ -322,7 +450,7 @@ function App() {
       void dragPromise.then((unlisten) => unlisten());
       void aspectPromise.then((unlisten) => unlisten());
     };
-  }, [pushLog, resolvePaths]);
+  }, [pushLog, refreshModelStatus, resolvePaths]);
 
   const chooseInputs = async () => {
     if (!isTauriRuntime()) {
@@ -383,10 +511,19 @@ function App() {
     const pending = queue
       .filter((item) => item.status === "pending" || item.status === "error")
       .map((item) => item.path);
-    if (pending.length === 0 || busy) return;
+    if (pending.length === 0 || busy || downloadingModel) return;
     if (!options.generateDepth && !options.convertWebp) {
       pushLog("Enable depth generation, WebP conversion, or both.");
       return;
+    }
+    if (options.generateDepth && !modelStatuses[options.modelRepo]?.installed) {
+      setDownloadProgress({
+        modelRepo: options.modelRepo,
+        message: `Preparing ${modelName(options.modelRepo)}`,
+        bytesDownloaded: 0,
+        bytesTotal: modelStatuses[options.modelRepo]?.sizeBytes ?? 0,
+        percent: 0
+      });
     }
     setBusy(true);
     setQueue((current) =>
@@ -617,9 +754,11 @@ function App() {
             </select>
           </label>
           <p className="muted">
-            {options.generateDepth
-              ? `${modelName(options.modelRepo)} downloads on first run.`
-              : "Model downloads only when depth generation is enabled."}
+            {!options.generateDepth
+              ? "Model downloads only when depth generation is enabled."
+              : selectedModelStatus?.installed
+                ? `${modelName(options.modelRepo)} is installed.`
+                : `${modelName(options.modelRepo)} downloads when needed.`}
           </p>
           </section>
         </aside>
@@ -644,7 +783,12 @@ function App() {
             </button>
             <button
               className="primary"
-              disabled={busy || queue.length === 0 || (!options.generateDepth && !options.convertWebp)}
+              disabled={
+                busy ||
+                Boolean(downloadingModel) ||
+                queue.length === 0 ||
+                (!options.generateDepth && !options.convertWebp)
+              }
               onClick={start}
             >
               {busy ? <Loader2 className="spin" size={17} /> : <Play size={17} />}
@@ -671,6 +815,24 @@ function App() {
             {vramDisplay.label}
           </div>
         </div>
+
+        {activeDownload ? (
+          <section className="download-status">
+            <div>
+              <strong>{activeDownload.message}</strong>
+              <small>
+                {formatBytes(activeDownload.bytesDownloaded)} / {formatBytes(activeDownload.bytesTotal)}
+              </small>
+            </div>
+            <div className="progress-shell" aria-label="Model download progress">
+              <div
+                className="progress-fill"
+                style={{ width: `${Math.max(0, Math.min(100, activeDownload.percent ?? 0))}%` }}
+              />
+            </div>
+            <span>{activeDownload.percent === null ? "--" : `${activeDownload.percent.toFixed(1)}%`}</span>
+          </section>
+        ) : null}
 
         <section className={`drop-zone ${dragging ? "dragging" : ""}`}>
           <Download size={42} />
@@ -716,6 +878,42 @@ function App() {
         </section>
         </section>
       </main>
+      {showModelPrompt ? (
+        <div className="modal-backdrop" role="presentation">
+          <section className="model-modal" role="dialog" aria-modal="true" aria-labelledby="model-dialog-title">
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow">First launch</p>
+                <h3 id="model-dialog-title">Select a model to download</h3>
+              </div>
+              <button className="secondary" onClick={markModelPromptSeen}>
+                Later
+              </button>
+            </div>
+            <div className="model-choices">
+              {(Object.entries(MODEL_DETAILS) as Array<[ModelRepo, (typeof MODEL_DETAILS)[ModelRepo]]>).map(
+                ([repo, details]) => (
+                  <button
+                    className="model-choice"
+                    key={repo}
+                    disabled={Boolean(downloadingModel)}
+                    onClick={() => void downloadSelectedModel(repo, true)}
+                  >
+                    <span>
+                      <strong>{details.name}</strong>
+                      <small>{details.note}</small>
+                    </span>
+                    <span>
+                      <strong>{details.size}</strong>
+                      <small>{details.vram}</small>
+                    </span>
+                  </button>
+                )
+              )}
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

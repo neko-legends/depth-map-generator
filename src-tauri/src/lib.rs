@@ -46,6 +46,16 @@ struct VramStatus {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelStatus {
+    repo: String,
+    name: String,
+    installed: bool,
+    model_path: String,
+    size_bytes: u64,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DepthOptions {
@@ -70,6 +80,7 @@ struct WorkerJob {
     app_data_dir: String,
     env_dir: String,
     model_dir: String,
+    download_only: bool,
 }
 
 fn worker_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -171,7 +182,11 @@ fn command_from_python_spec(spec: &str) -> Command {
 fn is_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| IMAGE_EXTENSIONS.iter().any(|candidate| candidate.eq_ignore_ascii_case(ext)))
+        .map(|ext| {
+            IMAGE_EXTENSIONS
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+        })
         .unwrap_or(false)
 }
 
@@ -209,6 +224,22 @@ fn model_cache_name(model_repo: &str) -> Result<&'static str, String> {
     }
 }
 
+fn model_size_bytes(model_repo: &str) -> Result<u64, String> {
+    match model_repo {
+        "depth-anything/DA3-LARGE-1.1" => Ok(1_643_843_860),
+        "depth-anything/DA3-SMALL" => Ok(137_000_000),
+        _ => Err(format!("Unsupported depth model: {model_repo}")),
+    }
+}
+
+fn supported_models() -> [&'static str; 2] {
+    ["depth-anything/DA3-LARGE-1.1", "depth-anything/DA3-SMALL"]
+}
+
+fn model_dir_for(app_data: &Path, model_repo: &str) -> Result<PathBuf, String> {
+    Ok(app_data.join("models").join(model_cache_name(model_repo)?))
+}
+
 #[tauri::command]
 fn check_runtime(app: AppHandle) -> Result<RuntimeStatus, String> {
     let app_data = app_data_dir(&app)?;
@@ -220,6 +251,25 @@ fn check_runtime(app: AppHandle) -> Result<RuntimeStatus, String> {
         app_data_dir: app_data.display().to_string(),
         worker_path: worker.display().to_string(),
     })
+}
+
+#[tauri::command]
+fn get_model_status(app: AppHandle) -> Result<Vec<ModelStatus>, String> {
+    let app_data = app_data_dir(&app)?;
+    supported_models()
+        .into_iter()
+        .map(|repo| {
+            let model_dir = model_dir_for(&app_data, repo)?;
+            let model_path = model_dir.join("model.safetensors");
+            Ok(ModelStatus {
+                repo: repo.to_string(),
+                name: model_cache_name(repo)?.to_string(),
+                installed: model_path.exists(),
+                model_path: model_path.display().to_string(),
+                size_bytes: model_size_bytes(repo)?,
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -288,7 +338,11 @@ fn get_vram_status() -> VramStatus {
 }
 
 #[tauri::command]
-fn start_depth_job(app: AppHandle, paths: Vec<String>, options: DepthOptions) -> Result<String, String> {
+fn start_depth_job(
+    app: AppHandle,
+    paths: Vec<String>,
+    options: DepthOptions,
+) -> Result<String, String> {
     if paths.is_empty() {
         return Err("No input images were provided.".to_string());
     }
@@ -298,9 +352,7 @@ fn start_depth_job(app: AppHandle, paths: Vec<String>, options: DepthOptions) ->
     let app_data = app_data_dir(&app)?;
     let jobs_dir = app_data.join("jobs");
     let env_dir = app_data.join("python-env");
-    let model_dir = app_data
-        .join("models")
-        .join(model_cache_name(&options.model_repo)?);
+    let model_dir = model_dir_for(&app_data, &options.model_repo)?;
     fs::create_dir_all(&jobs_dir).map_err(|error| format!("Unable to create jobs dir: {error}"))?;
 
     let job_id = Uuid::new_v4().to_string();
@@ -311,6 +363,7 @@ fn start_depth_job(app: AppHandle, paths: Vec<String>, options: DepthOptions) ->
         app_data_dir: app_data.display().to_string(),
         env_dir: env_dir.display().to_string(),
         model_dir: model_dir.display().to_string(),
+        download_only: false,
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|error| format!("Unable to serialize job: {error}"))?;
@@ -376,13 +429,113 @@ fn start_depth_job(app: AppHandle, paths: Vec<String>, options: DepthOptions) ->
     Ok(job_id)
 }
 
+#[tauri::command]
+fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> {
+    let python = find_python().ok_or_else(|| "Python 3.10+ was not found on PATH.".to_string())?;
+    let worker = worker_path(&app)?;
+    let app_data = app_data_dir(&app)?;
+    let jobs_dir = app_data.join("jobs");
+    let env_dir = app_data.join("python-env");
+    let model_dir = model_dir_for(&app_data, &model_repo)?;
+    fs::create_dir_all(&jobs_dir).map_err(|error| format!("Unable to create jobs dir: {error}"))?;
+
+    let job_id = Uuid::new_v4().to_string();
+    let job_path = jobs_dir.join(format!("{job_id}.json"));
+    let options = DepthOptions {
+        device: "auto".to_string(),
+        model_repo,
+        output_format: "png8".to_string(),
+        generate_depth: true,
+        convert_webp: false,
+        webp_quality: 92,
+        invert: true,
+        recursive: true,
+        overwrite: false,
+        suffix: "_depth".to_string(),
+        resize_mode: "none".to_string(),
+        resize_value: 1024,
+    };
+    let job = WorkerJob {
+        paths: Vec::new(),
+        options,
+        app_data_dir: app_data.display().to_string(),
+        env_dir: env_dir.display().to_string(),
+        model_dir: model_dir.display().to_string(),
+        download_only: true,
+    };
+    let job_json = serde_json::to_string_pretty(&job)
+        .map_err(|error| format!("Unable to serialize job: {error}"))?;
+    fs::write(&job_path, job_json).map_err(|error| format!("Unable to write job: {error}"))?;
+
+    let mut command = command_from_python_spec(&python);
+    command
+        .arg(worker)
+        .arg("--job")
+        .arg(job_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Unable to start Python worker: {error}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let app_for_stdout = app.clone();
+    let app_for_stderr = app.clone();
+
+    thread::spawn(move || {
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let _ = app_for_stdout.emit("depth-worker-event", value);
+                } else {
+                    let _ = app_for_stdout.emit(
+                        "depth-worker-event",
+                        serde_json::json!({ "type": "setup", "message": line }),
+                    );
+                }
+            }
+        }
+    });
+
+    thread::spawn(move || {
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = app_for_stderr.emit(
+                    "depth-worker-event",
+                    serde_json::json!({ "type": "setup", "message": line }),
+                );
+            }
+        }
+    });
+
+    thread::spawn(move || {
+        let status = child.wait();
+        if !matches!(status, Ok(status) if status.success()) {
+            let _ = app.emit(
+                "depth-worker-event",
+                serde_json::json!({
+                    "type": "error",
+                    "message": "Model download worker exited with an error."
+                }),
+            );
+        }
+    });
+
+    Ok(job_id)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             check_runtime,
+            get_model_status,
             get_vram_status,
+            download_model,
             resolve_inputs,
             start_depth_job
         ])
