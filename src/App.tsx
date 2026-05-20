@@ -171,6 +171,7 @@ const MODEL_DETAILS: Record<ModelRepo, { name: string; size: string; vram: strin
     note: "Lower VRAM, faster download."
   }
 };
+const LOADING_NOISE = ["!@!#$%%^^&()", "#$%%^^&()!@!", "%%^^&()!@!#$", "^^&()!@!#$%%", "&()!@!#$%%^^"];
 
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 const isTauriRuntime = () => "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
@@ -306,7 +307,9 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const [preloadingModel, setPreloadingModel] = useState<ModelRepo | null>(null);
   const [loadedModelKey, setLoadedModelKey] = useState<string | null>(null);
+  const [loadingNoise, setLoadingNoise] = useState(LOADING_NOISE[0]);
   const preloadKeyRef = useRef<string | null>(null);
+  const preloadTimerRef = useRef<number | null>(null);
 
   const completeCount = useMemo(
     () => queue.filter((item) => item.status === "done").length,
@@ -330,6 +333,19 @@ function App() {
   const pushLog = useCallback((line: string) => {
     setLog((current) => [line, ...current].slice(0, 80));
   }, []);
+
+  useEffect(() => {
+    if (!activeModelLoad) {
+      setLoadingNoise(LOADING_NOISE[0]);
+      return;
+    }
+    let index = 0;
+    const interval = window.setInterval(() => {
+      index = (index + 1) % LOADING_NOISE.length;
+      setLoadingNoise(LOADING_NOISE[index]);
+    }, 180);
+    return () => window.clearInterval(interval);
+  }, [activeModelLoad]);
 
   useEffect(() => {
     queueRef.current = queue;
@@ -493,6 +509,10 @@ function App() {
     if (!isTauriRuntime()) return;
 
     if (!options.keepModelLoaded || !options.generateDepth) {
+      if (preloadTimerRef.current !== null) {
+        window.clearTimeout(preloadTimerRef.current);
+        preloadTimerRef.current = null;
+      }
       preloadKeyRef.current = null;
       setPreloadingModel(null);
       setLoadedModelKey(null);
@@ -500,6 +520,11 @@ function App() {
         pushLog(`Could not stop cached model worker: ${String(error)}`)
       );
       return;
+    }
+
+    if (preloadTimerRef.current !== null) {
+      window.clearTimeout(preloadTimerRef.current);
+      preloadTimerRef.current = null;
     }
 
     if (!selectedModelStatus?.installed || busy || downloadingModel || preloadingModel) {
@@ -512,20 +537,36 @@ function App() {
     }
 
     preloadKeyRef.current = preloadKey;
-    setPreloadingModel(options.modelRepo);
-    setLoadedModelKey(null);
-    setHeadline(`Loading ${modelName(options.modelRepo)} into memory`);
-    pushLog(`Loading ${modelName(options.modelRepo)} into memory for faster batches.`);
-    void invoke("preload_model", { options }).catch((error) => {
-      preloadKeyRef.current = null;
-      setPreloadingModel(null);
+    const preloadOptions: DepthOptions = {
+      ...defaultOptions,
+      device: options.device,
+      modelRepo: options.modelRepo,
+      generateDepth: true,
+      keepModelLoaded: true
+    };
+    preloadTimerRef.current = window.setTimeout(() => {
+      preloadTimerRef.current = null;
+      setPreloadingModel(preloadOptions.modelRepo);
       setLoadedModelKey(null);
-      pushLog(`Model preload failed: ${String(error)}`);
-    });
+      setHeadline(`Loading ${modelName(preloadOptions.modelRepo)} into memory`);
+      pushLog(`Loading ${modelName(preloadOptions.modelRepo)} into memory for faster batches.`);
+      void invoke("preload_model", { options: preloadOptions }).catch((error) => {
+        preloadKeyRef.current = null;
+        setPreloadingModel(null);
+        setLoadedModelKey(null);
+        pushLog(`Model preload failed: ${String(error)}`);
+      });
+    }, 1200);
+
+    return () => {
+      if (preloadTimerRef.current !== null) {
+        window.clearTimeout(preloadTimerRef.current);
+        preloadTimerRef.current = null;
+      }
+    };
   }, [
     busy,
     downloadingModel,
-    options,
     options.device,
     options.generateDepth,
     options.keepModelLoaded,
@@ -1421,15 +1462,12 @@ function App() {
         ) : null}
 
         {activeModelLoad ? (
-          <section className="download-status model-load-status">
+          <section className="model-load-status">
             <div>
               <strong>Loading {modelName(activeModelLoad)} into memory</strong>
               <small>Keeping DA3 warm for faster repeat batches</small>
             </div>
-            <div className="progress-shell" aria-label="Model loading progress">
-              <div className="progress-fill indeterminate" />
-            </div>
-            <span>Loading</span>
+            <code aria-label="Model loading indicator">{loadingNoise}</code>
           </section>
         ) : null}
 

@@ -493,10 +493,11 @@ class ModelCache:
         self.device = None
 
     def load(self, options: dict[str, Any], model_dir: Path) -> tuple[Any, Any]:
+        model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
+        emit("model", f"Preparing {model_repo.split('/')[-1]} runtime")
         import torch as torch_module
         from depth_anything_3.api import DepthAnything3
 
-        model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
         device = choose_device(options["device"])
         device_key = str(device)
 
@@ -534,6 +535,23 @@ class ModelCache:
         return torch_module, model
 
 
+def warm_model(torch: Any, model: Any, options: dict[str, Any]) -> None:
+    from PIL import Image
+
+    emit("model", "Warming model on a tiny test image")
+    with TemporaryDirectory(prefix="depthmapai-warm-") as temp:
+        warm_path = Path(temp) / "warmup.png"
+        Image.new("RGB", (64, 64), (0, 0, 0)).save(warm_path)
+        with torch.inference_mode():
+            model.inference(
+                [str(warm_path)],
+                process_res=336,
+                process_res_method=options.get("processResMethod", "upper_bound_resize"),
+            )
+    model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
+    emit("model_ready", f"{model_repo.split('/')[-1]} warmed and ready.", modelRepo=model_repo)
+
+
 def run_job(job: dict[str, Any], cache: ModelCache | None = None) -> None:
     options = job["options"]
     paths = [Path(path) for path in job["paths"]]
@@ -550,7 +568,8 @@ def run_job(job: dict[str, Any], cache: ModelCache | None = None) -> None:
             emit("done", "Depth generation is disabled; model preload skipped.")
             return
         model_cache = cache or ModelCache()
-        model_cache.load(options, Path(job["model_dir"]))
+        torch, model = model_cache.load(options, Path(job["model_dir"]))
+        warm_model(torch, model, options)
         emit("done", f"{options.get('modelRepo', DEFAULT_MODEL_REPO).split('/')[-1]} is loaded and ready.")
         return
 
