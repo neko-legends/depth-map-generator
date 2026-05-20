@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import venv
 from pathlib import Path
 from typing import Any
@@ -167,12 +168,17 @@ def ensure_env(env_dir: Path, need_depth: bool) -> Path:
     return python_path
 
 
-def relaunch_in_env(job_path: Path, env_dir: Path, need_depth: bool) -> int:
+def relaunch_in_env(job_path: Path, env_dir: Path, need_depth: bool, daemon: bool) -> int:
     python_path = ensure_env(env_dir, need_depth)
     env = os.environ.copy()
     env["DEPTHMAPAI_VENV_ACTIVE"] = "1"
+    args = [str(python_path), str(Path(__file__).resolve())]
+    if daemon:
+        args.append("--daemon")
+    args.extend(["--job", str(job_path)])
     process = subprocess.Popen(
-        [str(python_path), str(Path(__file__).resolve()), "--job", str(job_path)],
+        args,
+        stdin=subprocess.PIPE if daemon else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -181,6 +187,24 @@ def relaunch_in_env(job_path: Path, env_dir: Path, need_depth: bool) -> int:
         env=env,
     )
     assert process.stdout is not None
+    if daemon:
+        assert process.stdin is not None
+
+        def forward_stdin() -> None:
+            try:
+                for line in sys.stdin:
+                    process.stdin.write(line)
+                    process.stdin.flush()
+            except Exception:
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=forward_stdin, daemon=True).start()
+
     for line in process.stdout:
         print(line, end="", flush=True)
     return process.wait()
@@ -449,7 +473,68 @@ def ensure_model(model_repo: str, model_dir: Path) -> Path:
     return model_dir
 
 
-def run_job(job: dict[str, Any]) -> None:
+class ModelCache:
+    def __init__(self) -> None:
+        self.model: Any | None = None
+        self.torch: Any | None = None
+        self.model_repo: str | None = None
+        self.device: str | None = None
+
+    def clear(self) -> None:
+        if self.model is not None:
+            del self.model
+        self.model = None
+        if self.torch is not None and hasattr(self.torch, "cuda"):
+            try:
+                self.torch.cuda.empty_cache()
+            except Exception:
+                pass
+        self.model_repo = None
+        self.device = None
+
+    def load(self, options: dict[str, Any], model_dir: Path) -> tuple[Any, Any]:
+        import torch as torch_module
+        from depth_anything_3.api import DepthAnything3
+
+        model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
+        device = choose_device(options["device"])
+        device_key = str(device)
+
+        if (
+            self.model is not None
+            and self.torch is not None
+            and self.model_repo == model_repo
+            and self.device == device_key
+        ):
+            emit(
+                "model_ready",
+                f"{model_repo.split('/')[-1]} is already loaded on {device_key}.",
+                modelRepo=model_repo,
+                device=device_key,
+            )
+            return self.torch, self.model
+
+        self.clear()
+        resolved_model_dir = ensure_model(model_repo, model_dir)
+        emit("model", f"Loading {model_repo.split('/')[-1]} on {device_key}", modelRepo=model_repo, device=device_key)
+        model = DepthAnything3.from_pretrained(str(resolved_model_dir))
+        model = model.to(device=device)
+        model.eval()
+
+        self.torch = torch_module
+        self.model = model
+        self.model_repo = model_repo
+        self.device = device_key
+        emit(
+            "model_ready",
+            f"{model_repo.split('/')[-1]} loaded on {device_key}.",
+            modelRepo=model_repo,
+            device=device_key,
+        )
+        return torch_module, model
+
+
+def run_job(job: dict[str, Any], cache: ModelCache | None = None) -> None:
     options = job["options"]
     paths = [Path(path) for path in job["paths"]]
     generate_depth = bool(options.get("generateDepth", True))
@@ -457,7 +542,17 @@ def run_job(job: dict[str, Any]) -> None:
     model = None
     torch = None
     download_only = bool(job.get("download_only", False))
+    preload_only = bool(job.get("preload_only", False))
     overwrite = bool(options.get("overwrite", False))
+
+    if preload_only:
+        if not generate_depth:
+            emit("done", "Depth generation is disabled; model preload skipped.")
+            return
+        model_cache = cache or ModelCache()
+        model_cache.load(options, Path(job["model_dir"]))
+        emit("done", f"{options.get('modelRepo', DEFAULT_MODEL_REPO).split('/')[-1]} is loaded and ready.")
+        return
 
     if download_only:
         model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
@@ -469,18 +564,8 @@ def run_job(job: dict[str, Any]) -> None:
         raise RuntimeError("No outputs selected. Enable depth generation or WebP conversion.")
 
     if generate_depth:
-        import torch as torch_module
-        from depth_anything_3.api import DepthAnything3
-
-        torch = torch_module
-        model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
-        model_dir = ensure_model(model_repo, Path(job["model_dir"]))
-        device = choose_device(options["device"])
-
-        emit("model", f"Loading {model_repo.split('/')[-1]} on {device}")
-        model = DepthAnything3.from_pretrained(str(model_dir))
-        model = model.to(device=device)
-        model.eval()
+        model_cache = cache or ModelCache()
+        torch, model = model_cache.load(options, Path(job["model_dir"]))
 
     for image_path in paths:
         output_path = output_path_for(
@@ -538,18 +623,44 @@ def run_job(job: dict[str, Any]) -> None:
     emit("done", "Batch finished.")
 
 
+def daemon_loop() -> int:
+    cache = ModelCache()
+    emit("model", "Persistent worker ready.")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            job = json.loads(line)
+        except Exception as error:
+            emit("error", f"Invalid worker command: {error}")
+            continue
+        if job.get("shutdown"):
+            cache.clear()
+            return 0
+        try:
+            run_job(job, cache)
+        except Exception as error:  # noqa: BLE001 - top-level daemon command error.
+            emit("error", str(error))
+    cache.clear()
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--daemon", action="store_true")
     parser.add_argument("--job", required=True)
     args = parser.parse_args()
     job_path = Path(args.job)
     job = json.loads(job_path.read_text(encoding="utf-8"))
 
     if os.environ.get("DEPTHMAPAI_VENV_ACTIVE") != "1":
-        need_depth = bool(job.get("options", {}).get("generateDepth", True))
-        return relaunch_in_env(job_path, Path(job["env_dir"]), need_depth)
+        need_depth = args.daemon or bool(job.get("options", {}).get("generateDepth", True))
+        return relaunch_in_env(job_path, Path(job["env_dir"]), need_depth, args.daemon)
 
     try:
+        if args.daemon:
+            return daemon_loop()
         run_job(job)
         return 0
     except Exception as error:  # noqa: BLE001 - top-level worker error.

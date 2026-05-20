@@ -2,9 +2,9 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{ChildStdin, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
 };
@@ -82,6 +82,7 @@ struct DepthOptions {
     normalize_low: f32,
     normalize_high: f32,
     depth_gamma: f32,
+    keep_model_loaded: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +93,7 @@ struct WorkerJob {
     env_dir: String,
     model_dir: String,
     download_only: bool,
+    preload_only: bool,
 }
 
 #[derive(Clone, Default)]
@@ -156,6 +158,42 @@ impl ActiveJobState {
         *active = None;
         Ok(canceled)
     }
+
+    fn finish_current(&self) -> Result<Option<bool>, String> {
+        let mut active = self
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock active job state.".to_string())?;
+        let canceled = active.as_ref().map(|job| job.cancel_requested);
+        *active = None;
+        Ok(canceled)
+    }
+
+    fn finish_pid(&self, pid: u32) -> Result<Option<bool>, String> {
+        let mut active = self
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock active job state.".to_string())?;
+        let Some(job) = active.as_ref() else {
+            return Ok(None);
+        };
+        if job.pid != pid {
+            return Ok(None);
+        }
+        let canceled = job.cancel_requested;
+        *active = None;
+        Ok(Some(canceled))
+    }
+}
+
+#[derive(Clone, Default)]
+struct PersistentWorkerState {
+    inner: Arc<Mutex<Option<PersistentWorker>>>,
+}
+
+struct PersistentWorker {
+    pid: u32,
+    stdin: Arc<Mutex<ChildStdin>>,
 }
 
 fn worker_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -423,6 +461,231 @@ fn model_dir_for(app_data: &Path, model_repo: &str) -> Result<PathBuf, String> {
     Ok(app_data.join("models").join(model_cache_name(model_repo)?))
 }
 
+fn terminal_worker_event(value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|event_type| matches!(event_type, "done" | "error" | "canceled"))
+}
+
+fn persistent_worker(
+    app: &AppHandle,
+    persistent_workers: &PersistentWorkerState,
+    active_jobs: &ActiveJobState,
+) -> Result<(u32, Arc<Mutex<ChildStdin>>), String> {
+    if let Some(worker) = persistent_workers
+        .inner
+        .lock()
+        .map_err(|_| "Unable to lock persistent worker state.".to_string())?
+        .as_ref()
+    {
+        return Ok((worker.pid, worker.stdin.clone()));
+    }
+
+    let python = find_python()
+        .ok_or_else(|| "Python 3.10, 3.11, or 3.12 was not found on PATH.".to_string())?;
+    let worker = worker_path(app)?;
+    let app_data = app_data_dir(app)?;
+    let jobs_dir = app_data.join("jobs");
+    let env_dir = app_data.join("python-env");
+    let model_dir = model_dir_for(&app_data, "depth-anything/DA3-LARGE-1.1")?;
+    fs::create_dir_all(&jobs_dir).map_err(|error| format!("Unable to create jobs dir: {error}"))?;
+
+    let job_id = Uuid::new_v4().to_string();
+    let job_path = jobs_dir.join(format!("persistent-{job_id}.json"));
+    let options = DepthOptions {
+        device: "auto".to_string(),
+        model_repo: "depth-anything/DA3-LARGE-1.1".to_string(),
+        output_format: "png8".to_string(),
+        generate_depth: true,
+        convert_webp: false,
+        webp_quality: 92,
+        invert: true,
+        recursive: true,
+        overwrite: false,
+        output_dir: String::new(),
+        suffix: "_depth".to_string(),
+        resize_mode: "none".to_string(),
+        resize_value: 1024,
+        process_res: 504,
+        process_res_method: "upper_bound_resize".to_string(),
+        normalize_low: 1.0,
+        normalize_high: 99.0,
+        depth_gamma: 1.0,
+        keep_model_loaded: true,
+    };
+    let job = WorkerJob {
+        paths: Vec::new(),
+        options,
+        app_data_dir: app_data.display().to_string(),
+        env_dir: env_dir.display().to_string(),
+        model_dir: model_dir.display().to_string(),
+        download_only: false,
+        preload_only: false,
+    };
+    fs::write(
+        &job_path,
+        serde_json::to_string_pretty(&job)
+            .map_err(|error| format!("Unable to serialize persistent worker config: {error}"))?,
+    )
+    .map_err(|error| format!("Unable to write persistent worker config: {error}"))?;
+
+    let mut command = command_from_python_spec(&python);
+    configure_worker_command(&mut command);
+    command
+        .arg(worker)
+        .arg("--daemon")
+        .arg("--job")
+        .arg(job_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Unable to start persistent Python worker: {error}"))?;
+    let child_pid = child.id();
+    let Some(stdin) = child.stdin.take() else {
+        let _ = kill_process_tree(child_pid);
+        return Err("Unable to open persistent worker input pipe.".to_string());
+    };
+    let stdin = Arc::new(Mutex::new(stdin));
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let app_for_stdout = app.clone();
+    let app_for_stderr = app.clone();
+    let app_for_wait = app.clone();
+    let active_jobs_for_stdout = (*active_jobs).clone();
+    let active_jobs_for_wait = (*active_jobs).clone();
+    let persistent_for_wait = (*persistent_workers).clone();
+
+    thread::spawn(move || {
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let terminal = terminal_worker_event(&value);
+                    let _ = app_for_stdout.emit("depth-worker-event", value);
+                    if terminal {
+                        let _ = active_jobs_for_stdout.finish_current();
+                    }
+                } else {
+                    let _ = app_for_stdout.emit(
+                        "depth-worker-event",
+                        serde_json::json!({ "type": "setup", "message": line }),
+                    );
+                }
+            }
+        }
+    });
+
+    thread::spawn(move || {
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = app_for_stderr.emit(
+                    "depth-worker-event",
+                    serde_json::json!({ "type": "setup", "message": line }),
+                );
+            }
+        }
+    });
+
+    thread::spawn(move || {
+        let status = child.wait();
+        if let Ok(mut worker) = persistent_for_wait.inner.lock() {
+            if worker
+                .as_ref()
+                .is_some_and(|worker| worker.pid == child_pid)
+            {
+                *worker = None;
+            }
+        }
+        let canceled = active_jobs_for_wait
+            .finish_pid(child_pid)
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        if canceled {
+            let _ = app_for_wait.emit(
+                "depth-worker-event",
+                serde_json::json!({
+                    "type": "canceled",
+                    "message": "Job canceled."
+                }),
+            );
+        } else if !matches!(status, Ok(status) if status.success()) {
+            let _ = app_for_wait.emit(
+                "depth-worker-event",
+                serde_json::json!({
+                    "type": "error",
+                    "message": "Persistent depth worker exited with an error."
+                }),
+            );
+        }
+    });
+
+    let mut slot = persistent_workers
+        .inner
+        .lock()
+        .map_err(|_| "Unable to lock persistent worker state.".to_string())?;
+    if let Some(existing) = slot.as_ref() {
+        let _ = kill_process_tree(child_pid);
+        return Ok((existing.pid, existing.stdin.clone()));
+    }
+    *slot = Some(PersistentWorker {
+        pid: child_pid,
+        stdin: stdin.clone(),
+    });
+    Ok((child_pid, stdin))
+}
+
+fn enqueue_persistent_job(
+    app: AppHandle,
+    persistent_workers: State<'_, PersistentWorkerState>,
+    active_jobs: State<'_, ActiveJobState>,
+    paths: Vec<String>,
+    options: DepthOptions,
+    preload_only: bool,
+) -> Result<String, String> {
+    if active_jobs.is_busy()? {
+        return Err("Another job is already running.".to_string());
+    }
+
+    let app_data = app_data_dir(&app)?;
+    let env_dir = app_data.join("python-env");
+    let model_dir = model_dir_for(&app_data, &options.model_repo)?;
+    let job_id = Uuid::new_v4().to_string();
+    let job = WorkerJob {
+        paths,
+        options,
+        app_data_dir: app_data.display().to_string(),
+        env_dir: env_dir.display().to_string(),
+        model_dir: model_dir.display().to_string(),
+        download_only: false,
+        preload_only,
+    };
+    let job_json = serde_json::to_string(&job)
+        .map_err(|error| format!("Unable to serialize persistent job: {error}"))?;
+    let (pid, stdin) = persistent_worker(&app, &persistent_workers, &active_jobs)?;
+    if let Err(error) = active_jobs.start(job_id.clone(), pid) {
+        return Err(error);
+    }
+    let send_result = stdin
+        .lock()
+        .map_err(|_| "Unable to lock persistent worker input.".to_string())
+        .and_then(|mut input| {
+            writeln!(input, "{job_json}")
+                .and_then(|_| input.flush())
+                .map_err(|error| format!("Unable to send job to persistent worker: {error}"))
+        });
+    if let Err(error) = send_result {
+        let _ = active_jobs.finish(&job_id);
+        return Err(error);
+    }
+    Ok(job_id)
+}
+
 fn image_mime_type(path: &Path) -> Result<&'static str, String> {
     match path
         .extension()
@@ -635,6 +898,7 @@ fn get_vram_status() -> VramStatus {
 #[tauri::command]
 fn start_depth_job(
     app: AppHandle,
+    persistent_workers: State<'_, PersistentWorkerState>,
     active_jobs: State<'_, ActiveJobState>,
     paths: Vec<String>,
     options: DepthOptions,
@@ -644,6 +908,9 @@ fn start_depth_job(
     }
     if active_jobs.is_busy()? {
         return Err("Another job is already running.".to_string());
+    }
+    if options.keep_model_loaded && options.generate_depth {
+        return enqueue_persistent_job(app, persistent_workers, active_jobs, paths, options, false);
     }
 
     let python = find_python()
@@ -664,6 +931,7 @@ fn start_depth_job(
         env_dir: env_dir.display().to_string(),
         model_dir: model_dir.display().to_string(),
         download_only: false,
+        preload_only: false,
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|error| format!("Unable to serialize job: {error}"))?;
@@ -785,6 +1053,7 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
         normalize_low: 1.0,
         normalize_high: 99.0,
         depth_gamma: 1.0,
+        keep_model_loaded: false,
     };
     let job = WorkerJob {
         paths: Vec::new(),
@@ -793,6 +1062,7 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
         env_dir: env_dir.display().to_string(),
         model_dir: model_dir.display().to_string(),
         download_only: true,
+        preload_only: false,
     };
     let job_json = serde_json::to_string_pretty(&job)
         .map_err(|error| format!("Unable to serialize job: {error}"))?;
@@ -884,9 +1154,52 @@ fn cancel_active_job(active_jobs: State<'_, ActiveJobState>) -> Result<(), Strin
     kill_process_tree(pid)
 }
 
+#[tauri::command]
+fn preload_model(
+    app: AppHandle,
+    persistent_workers: State<'_, PersistentWorkerState>,
+    active_jobs: State<'_, ActiveJobState>,
+    options: DepthOptions,
+) -> Result<String, String> {
+    if !options.keep_model_loaded || !options.generate_depth {
+        return Ok("Model preload disabled.".to_string());
+    }
+    enqueue_persistent_job(
+        app,
+        persistent_workers,
+        active_jobs,
+        Vec::new(),
+        options,
+        true,
+    )
+}
+
+#[tauri::command]
+fn stop_persistent_worker(
+    persistent_workers: State<'_, PersistentWorkerState>,
+    active_jobs: State<'_, ActiveJobState>,
+) -> Result<(), String> {
+    if active_jobs.is_busy()? {
+        return Ok(());
+    }
+    let worker = persistent_workers
+        .inner
+        .lock()
+        .map_err(|_| "Unable to lock persistent worker state.".to_string())?
+        .take();
+    if let Some(worker) = worker {
+        if let Ok(mut input) = worker.stdin.lock() {
+            let _ = writeln!(input, "{}", serde_json::json!({ "shutdown": true }));
+            let _ = input.flush();
+        }
+    }
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(ActiveJobState::default())
+        .manage(PersistentWorkerState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -898,9 +1211,11 @@ pub fn run() {
             open_model_folder,
             open_package_report,
             open_containing_folder,
+            preload_model,
             preview_image_data_url,
             resolve_inputs,
-            start_depth_job
+            start_depth_job,
+            stop_persistent_worker
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

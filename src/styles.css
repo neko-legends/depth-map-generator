@@ -462,6 +462,15 @@ button:disabled {
   transition: width 0.18s ease;
 }
 
+.model-load-status .progress-shell {
+  position: relative;
+}
+
+.progress-fill.indeterminate {
+  width: 42%;
+  animation: loading-slide 1.05s ease-in-out infinite;
+}
+
 .media-grid {
   display: grid;
   grid-template-columns: minmax(360px, 0.85fr) 1fr;
@@ -842,5 +851,14 @@ button:disabled {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes loading-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(250%);
   }
 }

@@ -77,6 +77,7 @@ type DepthOptions = {
   normalizeLow: number;
   normalizeHigh: number;
   depthGamma: number;
+  keepModelLoaded: boolean;
 };
 
 type QueueItem = {
@@ -90,6 +91,7 @@ type WorkerEvent = {
   type:
     | "setup"
     | "model"
+    | "model_ready"
     | "download_progress"
     | "image_start"
     | "image_done"
@@ -101,6 +103,7 @@ type WorkerEvent = {
   path?: string;
   output?: string;
   modelRepo?: ModelRepo;
+  device?: string;
   bytesDownloaded?: number;
   bytesTotal?: number;
   percent?: number | null;
@@ -138,7 +141,8 @@ const defaultOptions: DepthOptions = {
   processResMethod: "upper_bound_resize",
   normalizeLow: 1,
   normalizeHigh: 99,
-  depthGamma: 1
+  depthGamma: 1,
+  keepModelLoaded: true
 };
 
 const SETTINGS_STORAGE_KEY = "depthmapai.settings.v1";
@@ -216,7 +220,8 @@ function loadSavedOptions(): DepthOptions {
       ),
       normalizeLow: coerceNumber(parsed.normalizeLow, defaultOptions.normalizeLow, 0, 99),
       normalizeHigh: coerceNumber(parsed.normalizeHigh, defaultOptions.normalizeHigh, 1, 100),
-      depthGamma: coerceNumber(parsed.depthGamma, defaultOptions.depthGamma, 0.2, 4)
+      depthGamma: coerceNumber(parsed.depthGamma, defaultOptions.depthGamma, 0.2, 4),
+      keepModelLoaded: coerceBoolean(parsed.keepModelLoaded, defaultOptions.keepModelLoaded)
     };
     if (loaded.normalizeLow >= loaded.normalizeHigh) {
       loaded.normalizeLow = defaultOptions.normalizeLow;
@@ -299,6 +304,9 @@ function App() {
   const [showModelPrompt, setShowModelPrompt] = useState(false);
   const [downloadingModel, setDownloadingModel] = useState<ModelRepo | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
+  const [preloadingModel, setPreloadingModel] = useState<ModelRepo | null>(null);
+  const [loadedModelKey, setLoadedModelKey] = useState<string | null>(null);
+  const preloadKeyRef = useRef<string | null>(null);
 
   const completeCount = useMemo(
     () => queue.filter((item) => item.status === "done").length,
@@ -311,6 +319,8 @@ function App() {
   const vramDisplay = useMemo(() => formatVram(vram), [vram]);
   const selectedModelStatus = modelStatuses[options.modelRepo];
   const activeDownload = downloadProgress;
+  const activeModelLoad = preloadingModel && !activeDownload ? preloadingModel : null;
+  const currentModelReady = loadedModelKey?.startsWith(`${options.modelRepo}:`);
   const selectedItem = useMemo(
     () => queue.find((item) => item.path === selectedPath) ?? queue[0],
     [queue, selectedPath]
@@ -479,6 +489,52 @@ function App() {
       .catch((error) => pushLog(`Could not read model status: ${String(error)}`));
   }, [pushLog, refreshModelStatus]);
 
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+
+    if (!options.keepModelLoaded || !options.generateDepth) {
+      preloadKeyRef.current = null;
+      setPreloadingModel(null);
+      setLoadedModelKey(null);
+      void invoke("stop_persistent_worker").catch((error) =>
+        pushLog(`Could not stop cached model worker: ${String(error)}`)
+      );
+      return;
+    }
+
+    if (!selectedModelStatus?.installed || busy || downloadingModel || preloadingModel) {
+      return;
+    }
+
+    const preloadKey = `${options.modelRepo}:${options.device}`;
+    if (preloadKeyRef.current === preloadKey) {
+      return;
+    }
+
+    preloadKeyRef.current = preloadKey;
+    setPreloadingModel(options.modelRepo);
+    setLoadedModelKey(null);
+    setHeadline(`Loading ${modelName(options.modelRepo)} into memory`);
+    pushLog(`Loading ${modelName(options.modelRepo)} into memory for faster batches.`);
+    void invoke("preload_model", { options }).catch((error) => {
+      preloadKeyRef.current = null;
+      setPreloadingModel(null);
+      setLoadedModelKey(null);
+      pushLog(`Model preload failed: ${String(error)}`);
+    });
+  }, [
+    busy,
+    downloadingModel,
+    options,
+    options.device,
+    options.generateDepth,
+    options.keepModelLoaded,
+    options.modelRepo,
+    preloadingModel,
+    pushLog,
+    selectedModelStatus?.installed
+  ]);
+
   const resolvePaths = useCallback(
     async (paths: string[]) => {
       if (paths.length === 0) return;
@@ -535,6 +591,11 @@ function App() {
       if (payload.message) {
         setHeadline(payload.message);
         pushLog(payload.message);
+      }
+
+      if (payload.type === "model_ready" && payload.modelRepo) {
+        setLoadedModelKey(`${payload.modelRepo}:${payload.device ?? "auto"}`);
+        setPreloadingModel(null);
       }
 
       if (payload.type === "download_progress" && payload.modelRepo) {
@@ -624,6 +685,11 @@ function App() {
         setCanceling(false);
         setDownloadingModel(null);
         setDownloadProgress(null);
+        setPreloadingModel(null);
+        if (payload.type === "error" || payload.type === "canceled") {
+          setLoadedModelKey(null);
+          preloadKeyRef.current = null;
+        }
         void refreshModelStatus().catch((error) =>
           pushLog(`Could not refresh model status: ${String(error)}`)
         );
@@ -833,7 +899,7 @@ function App() {
       pushLog("Generation requires the Tauri desktop shell.");
       return;
     }
-    if (busy || downloadingModel) return;
+    if (busy || downloadingModel || preloadingModel) return;
     const pendingPaths = queue
       .filter(
         (item) => item.status === "pending" || item.status === "error" || item.status === "canceled"
@@ -882,7 +948,7 @@ function App() {
   };
 
   const cancelActiveJob = async () => {
-    if (!isTauriRuntime() || (!busy && !downloadingModel) || canceling) return;
+    if (!isTauriRuntime() || (!busy && !downloadingModel && !preloadingModel) || canceling) return;
     setCanceling(true);
     setHeadline("Canceling job");
     pushLog("Cancel requested.");
@@ -1241,10 +1307,25 @@ function App() {
               <option value="depth-anything/DA3-SMALL">DA3-SMALL</option>
             </select>
           </label>
+          <label className="toggle keep-loaded-toggle">
+            <input
+              type="checkbox"
+              checked={options.keepModelLoaded}
+              disabled={!options.generateDepth}
+              onChange={(event) =>
+                setOptions((current) => ({ ...current, keepModelLoaded: event.target.checked }))
+              }
+            />
+            <span>Keep model loaded</span>
+          </label>
           <p className="muted">
             {!options.generateDepth
               ? "Model downloads only when depth generation is enabled."
-              : selectedModelStatus?.installed
+              : currentModelReady
+                ? `${modelName(options.modelRepo)} is loaded in memory.`
+                : preloadingModel === options.modelRepo
+                  ? `${modelName(options.modelRepo)} is loading into memory.`
+                  : selectedModelStatus?.installed
                 ? `${modelName(options.modelRepo)} is installed.`
                 : `${modelName(options.modelRepo)} downloads when needed.`}
           </p>
@@ -1282,6 +1363,7 @@ function App() {
               disabled={
                 busy ||
                 Boolean(downloadingModel) ||
+                Boolean(preloadingModel) ||
                 queue.length === 0 ||
                 (!options.generateDepth && !options.convertWebp)
               }
@@ -1292,7 +1374,7 @@ function App() {
             </button>
             <button
               className="secondary"
-              disabled={(!busy && !downloadingModel) || canceling}
+              disabled={(!busy && !downloadingModel && !preloadingModel) || canceling}
               onClick={cancelActiveJob}
             >
               {canceling ? <Loader2 className="spin" size={17} /> : <Square size={17} />}
@@ -1335,6 +1417,19 @@ function App() {
               />
             </div>
             <span>{activeDownload.percent === null ? "--" : `${activeDownload.percent.toFixed(1)}%`}</span>
+          </section>
+        ) : null}
+
+        {activeModelLoad ? (
+          <section className="download-status model-load-status">
+            <div>
+              <strong>Loading {modelName(activeModelLoad)} into memory</strong>
+              <small>Keeping DA3 warm for faster repeat batches</small>
+            </div>
+            <div className="progress-shell" aria-label="Model loading progress">
+              <div className="progress-fill indeterminate" />
+            </div>
+            <span>Loading</span>
           </section>
         ) : null}
 
