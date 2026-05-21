@@ -30,6 +30,9 @@ download, depth map export, and WebP conversion.
   - `depth-anything/DA3-SMALL` for lower VRAM machines.
 - First-launch model picker with Later option.
 - Model download progress with percent and downloaded size.
+- Optional Keep model loaded mode, enabled by default, to keep DA3 warm between
+  jobs.
+- Startup model preload when the selected model is already installed.
 - Buttons to open the model install folder and package report.
 - Device selector: Auto, CUDA, Apple MPS, CPU.
 - NVIDIA VRAM usage display when `nvidia-smi` is available.
@@ -216,6 +219,14 @@ environment.
 WebP-only runs install only Pillow. Depth-map runs install the ML runtime,
 install Depth Anything 3 from GitHub, and download the selected Hugging Face
 model when needed.
+
+Keep model loaded is enabled by default. When the selected model is already
+installed, the app starts a persistent Python worker after launch, loads DA3, and
+runs a tiny warm-up inference so the selected device is actually exercised. This
+reduces repeat-run latency because later depth jobs can reuse the loaded model
+instead of starting Python and loading DA3 again. The model-loading indicator is
+intentionally not a percentage bar because PyTorch/DA3 model load does not expose
+granular progress. Model downloads still show real percent progress.
 
 The Runtime panel can open `package-report.txt` in the app data folder. That
 report lists the direct install commands and, after setup has run, the exact
