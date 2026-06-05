@@ -71,6 +71,7 @@ type DepthOptions = {
   invert: boolean;
   recursive: boolean;
   overwrite: boolean;
+  autoGenerateOnChange: boolean;
   outputDir: string;
   suffix: string;
   resizeMode: ResizeMode;
@@ -143,6 +144,7 @@ const defaultOptions: DepthOptions = {
   invert: true,
   recursive: true,
   overwrite: false,
+  autoGenerateOnChange: false,
   outputDir: "",
   suffix: "_depth",
   resizeMode: "none",
@@ -231,6 +233,10 @@ function loadSavedOptions(): DepthOptions {
       invert: coerceBoolean(parsed.invert, defaultOptions.invert),
       recursive: coerceBoolean(parsed.recursive, defaultOptions.recursive),
       overwrite: coerceBoolean(parsed.overwrite, defaultOptions.overwrite),
+      autoGenerateOnChange: coerceBoolean(
+        parsed.autoGenerateOnChange,
+        defaultOptions.autoGenerateOnChange
+      ),
       outputDir: typeof parsed.outputDir === "string" ? parsed.outputDir : defaultOptions.outputDir,
       suffix: typeof parsed.suffix === "string" ? parsed.suffix : defaultOptions.suffix,
       resizeMode: coerceChoice(parsed.resizeMode, RESIZE_MODE_OPTIONS, defaultOptions.resizeMode),
@@ -342,6 +348,8 @@ function App() {
   const activePreloadKeyRef = useRef<string | null>(null);
   const failedPreloadKeyRef = useRef<string | null>(null);
   const preloadTimerRef = useRef<number | null>(null);
+  const autoGenerateTimerRef = useRef<number | null>(null);
+  const previousAutoGenerateKeyRef = useRef<string | null>(null);
 
   const completeCount = useMemo(
     () => queue.filter((item) => item.status === "done").length,
@@ -361,6 +369,45 @@ function App() {
     [queue, selectedPath]
   );
   const previewOutput = previewOutputPath(selectedItem?.outputHistory);
+  const autoGenerateParamsKey = useMemo(
+    () =>
+      JSON.stringify({
+        device: options.device,
+        modelRepo: options.modelRepo,
+        outputFormat: options.outputFormat,
+        generateDepth: options.generateDepth,
+        convertWebp: options.convertWebp,
+        webpQuality: options.webpQuality,
+        invert: options.invert,
+        outputDir: options.outputDir,
+        suffix: options.suffix,
+        resizeMode: options.resizeMode,
+        resizeValue: options.resizeValue,
+        processRes: options.processRes,
+        processResMethod: options.processResMethod,
+        normalizeLow: options.normalizeLow,
+        normalizeHigh: options.normalizeHigh,
+        depthGamma: options.depthGamma
+      }),
+    [
+      options.convertWebp,
+      options.depthGamma,
+      options.device,
+      options.generateDepth,
+      options.invert,
+      options.modelRepo,
+      options.normalizeHigh,
+      options.normalizeLow,
+      options.outputDir,
+      options.outputFormat,
+      options.processRes,
+      options.processResMethod,
+      options.resizeMode,
+      options.resizeValue,
+      options.suffix,
+      options.webpQuality
+    ]
+  );
 
   const pushLog = useCallback((line: string) => {
     setLog((current) => [line, ...current].slice(0, 80));
@@ -1025,7 +1072,7 @@ function App() {
     );
   };
 
-  const start = async () => {
+  const start = useCallback(async (trigger: "manual" | "auto" = "manual") => {
     if (!isTauriRuntime()) {
       pushLog("Generation requires the Tauri desktop shell.");
       return;
@@ -1042,6 +1089,9 @@ function App() {
     if (!options.generateDepth && !options.convertWebp) {
       pushLog("Enable depth generation, WebP conversion, or both.");
       return;
+    }
+    if (trigger === "auto") {
+      pushLog("Parameters changed. Regenerating queued images.");
     }
     if (rerunningCompletedQueue) {
       pushLog(
@@ -1076,7 +1126,55 @@ function App() {
       pushLog(String(error));
       setHeadline("Unable to start worker");
     }
-  };
+  }, [busy, downloadingModel, modelStatuses, options, preloadingModel, pushLog, queue]);
+
+  useEffect(() => {
+    if (previousAutoGenerateKeyRef.current === null) {
+      previousAutoGenerateKeyRef.current = autoGenerateParamsKey;
+      return;
+    }
+
+    const changed = previousAutoGenerateKeyRef.current !== autoGenerateParamsKey;
+    previousAutoGenerateKeyRef.current = autoGenerateParamsKey;
+    if (!changed || !options.autoGenerateOnChange) return;
+
+    if (autoGenerateTimerRef.current !== null) {
+      window.clearTimeout(autoGenerateTimerRef.current);
+      autoGenerateTimerRef.current = null;
+    }
+
+    if (
+      queue.length === 0 ||
+      busy ||
+      downloadingModel ||
+      preloadingModel ||
+      (!options.generateDepth && !options.convertWebp)
+    ) {
+      return;
+    }
+
+    autoGenerateTimerRef.current = window.setTimeout(() => {
+      autoGenerateTimerRef.current = null;
+      void start("auto");
+    }, 650);
+
+    return () => {
+      if (autoGenerateTimerRef.current !== null) {
+        window.clearTimeout(autoGenerateTimerRef.current);
+        autoGenerateTimerRef.current = null;
+      }
+    };
+  }, [
+    autoGenerateParamsKey,
+    busy,
+    downloadingModel,
+    options.autoGenerateOnChange,
+    options.convertWebp,
+    options.generateDepth,
+    preloadingModel,
+    queue.length,
+    start
+  ]);
 
   const cancelActiveJob = async () => {
     if (!isTauriRuntime() || (!busy && !downloadingModel && !preloadingModel) || canceling) return;
@@ -1092,6 +1190,10 @@ function App() {
   };
 
   const reset = () => {
+    if (autoGenerateTimerRef.current !== null) {
+      window.clearTimeout(autoGenerateTimerRef.current);
+      autoGenerateTimerRef.current = null;
+    }
     setQueue([]);
     setOutputPreviews({});
     setLog([]);
@@ -1408,6 +1510,17 @@ function App() {
             />
             <span>Overwrite existing outputs</span>
           </label>
+
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={options.autoGenerateOnChange}
+              onChange={(event) =>
+                setOptions((current) => ({ ...current, autoGenerateOnChange: event.target.checked }))
+              }
+            />
+            <span>Auto generate on changes</span>
+          </label>
           </section>
 
           <section className="runtime">
@@ -1500,7 +1613,7 @@ function App() {
                 queue.length === 0 ||
                 (!options.generateDepth && !options.convertWebp)
               }
-              onClick={start}
+              onClick={() => void start()}
             >
               {busy ? <Loader2 className="spin" size={17} /> : <Play size={17} />}
               Generate
