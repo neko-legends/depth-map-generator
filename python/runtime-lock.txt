@@ -1,0 +1,42 @@
+# Direct runtime dependency lock for the app-managed Python environment.
+# The worker installs these packages at first use; transitive dependencies are
+# resolved by pip from these pinned direct roots.
+
+--bootstrap
+pip==26.1.1
+setuptools==70.2.0
+wheel==0.47.0
+
+--webp
+pillow==12.2.0
+
+--ml-base
+huggingface_hub==1.15.0
+requests==2.34.2
+numpy==1.26.4
+pillow==12.2.0
+opencv-python==4.11.0.86
+safetensors==0.7.0
+addict==2.4.0
+
+--torch-cpu
+torch==2.11.0
+torchvision==0.26.0
+
+--torch-cuda-cu128
+--index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+
+--mda-runtime
+PyYAML==6.0.3
+omegaconf==2.3.0
+einops==0.8.2
+scipy==1.17.1
+tqdm==4.67.3
+sympy==1.14.0
+lightning-bolts==0.7.0
+
+--source-pins
+depth-anything-3 git commit 41736238f5bced4debf3f2a12375d2466874866d
+biansy000/MDA git commit 0a4ae22e6994a9794dfb24a1275c7fbf59112f2a

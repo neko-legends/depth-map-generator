@@ -6,8 +6,8 @@ need ControlNet-style depth maps without running ComfyUI.
 
 The app uses a Tauri 2 desktop shell with a React UI. Rust handles the desktop
 window, drag and drop, folder scanning, worker orchestration, and VRAM polling.
-Python handles Depth Anything 3 inference, first-run dependency setup, model
-download, depth map export, and WebP conversion.
+Python handles MDA and Depth Anything inference, first-run dependency setup,
+model download, depth map export, and WebP conversion.
 
 ## Features
 
@@ -26,11 +26,12 @@ download, depth map export, and WebP conversion.
 - The queue keeps output history per source image and shows recent output
   thumbnails first, so tuning changes can be compared without leaving the app.
 - Model selector:
-  - `depth-anything/DA3-LARGE-1.1` by default.
+  - `sy000/MDA/mda_mog_sky_l2` by default.
+  - `depth-anything/DA3-LARGE-1.1` as a smaller fallback.
   - `depth-anything/DA3-SMALL` for lower VRAM machines.
 - First-launch model picker with Later option.
 - Model download progress with percent and downloaded size.
-- Optional Keep model loaded mode, enabled by default, to keep DA3 warm between
+- Optional Keep model loaded mode, enabled by default, to keep the selected model warm between
   jobs.
 - Startup model preload when the selected model is already installed.
 - Buttons to open the model install folder and package report.
@@ -98,8 +99,11 @@ npm run tauri:build
 Expected Windows outputs:
 
 - `src-tauri\target\release\depth-map-ai-generator.exe`
-- `src-tauri\target\release\bundle\nsis\DepthMap AI Generator_0.1.1_x64-setup.exe`
-- `src-tauri\target\release\bundle\msi\DepthMap AI Generator_0.1.1_x64_en-US.msi`
+- `src-tauri\target\release\bundle\nsis\DepthMap AI Generator_26.6.5_x64-setup.exe`
+
+The release executable is the portable build. It embeds the app UI and Python
+worker script; on first use it creates the app-managed Python environment and
+downloads runtime packages and model weights into the app data folder.
 
 Runtime notes for agents:
 
@@ -108,9 +112,15 @@ Runtime notes for agents:
   files.
 - The app downloads model weights at runtime. Do not add Hugging Face model
   files to the repository.
+- Direct Python runtime dependencies are pinned in `python/runtime-lock.txt`
+  and mirrored by `python/da3_worker.py`.
 - WebP-only runs install Pillow in the app-managed Python environment.
-- Depth runs install the ML stack, Depth Anything 3, and the selected Hugging
-  Face model.
+- Depth runs install the ML stack, Depth Anything 3, and the selected model.
+  MDA also installs its runtime helpers, downloads the upstream MDA source, and
+  downloads the `sy000/MDA` checkpoint.
+- When `nvidia-smi` is available, the app-managed environment installs PyTorch
+  from the CUDA 12.8 wheel index and pins NumPy below 2 for Depth Anything
+  compatibility.
 - Python 3.13+ is not selected for the app-managed environment because some ML
   dependencies may not publish compatible wheels yet.
 - NVIDIA VRAM display depends on `nvidia-smi`; it is allowed to show unavailable
@@ -137,7 +147,7 @@ Run the desktop app:
 npm run tauri:dev
 ```
 
-Build Windows installers and the release executable:
+Build the NSIS setup installer and portable release executable:
 
 ```powershell
 npm run tauri:build
@@ -190,12 +200,43 @@ check for package names involved in recent npm supply-chain incidents found only
 `@vitejs/plugin-react`; the known compromised `debug@4.4.2` version is not in
 the lockfile.
 
+## Python Runtime Locking
+
+The app creates its own Python environment at runtime instead of committing a
+project `.venv`. Direct runtime packages are pinned in
+`python/runtime-lock.txt` and mirrored in `python/da3_worker.py`. This is
+intentional: unpinned Python installs can silently switch PyTorch wheel flavors,
+pull NumPy versions incompatible with Depth Anything, or change MDA transitive
+behavior.
+
+Pinned runtime choices include:
+
+- PyTorch `2.11.0` / torchvision `0.26.0`.
+- CUDA builds from the PyTorch CUDA 12.8 wheel index when `nvidia-smi` is
+  available.
+- NumPy `1.26.4` for Depth Anything compatibility.
+- Depth Anything 3 pinned to commit
+  `41736238f5bced4debf3f2a12375d2466874866d`.
+- MDA source pinned to commit
+  `0a4ae22e6994a9794dfb24a1275c7fbf59112f2a`.
+
+When intentionally upgrading Python runtime packages:
+
+1. Update `python/runtime-lock.txt`.
+2. Update matching constants in `python/da3_worker.py`.
+3. Bump the relevant app-managed environment marker in `python/da3_worker.py`.
+4. Run `python -m py_compile python\da3_worker.py`.
+5. Run a CUDA availability check in the app-managed environment when NVIDIA
+   support matters.
+6. Run an MDA preload and one small MDA batch job.
+7. Run `npm run tauri:build`.
+
 ## Runtime Behavior
 
-On first launch, the app offers to download either DA3-LARGE-1.1 or DA3-SMALL.
-Choosing Later skips the download. If depth generation is later started with no
-selected model installed, the worker downloads that model before inference and
-shows download progress in the UI.
+On first launch, the app offers to download MDA-DA3-MoG-Sky, DA3-LARGE-1.1, or
+DA3-SMALL. Choosing Later skips the download. If depth generation is later
+started with no selected model installed, the worker downloads that model before
+inference and shows download progress in the UI.
 
 By default, outputs are written beside each source image. The Settings panel can
 choose a single output folder instead. When overwrite is off and a target output
@@ -217,15 +258,18 @@ prefers Python 3.11, 3.12, or 3.10 and will not use Python 3.13+ for the managed
 environment.
 
 WebP-only runs install only Pillow. Depth-map runs install the ML runtime,
-install Depth Anything 3 from GitHub, and download the selected Hugging Face
-model when needed.
+install Depth Anything 3 from GitHub, and download the selected model when
+needed. MDA runs additionally download MDA's GitHub source and install the small
+extra runtime packages its wrappers import. On NVIDIA machines, the app forces
+the CUDA PyTorch wheel install so Auto can use the GPU instead of a CPU-only
+PyTorch wheel.
 
 Keep model loaded is enabled by default. When the selected model is already
-installed, the app starts a persistent Python worker after launch, loads DA3, and
+installed, the app starts a persistent Python worker after launch, loads it, and
 runs a tiny warm-up inference so the selected device is actually exercised. This
 reduces repeat-run latency because later depth jobs can reuse the loaded model
-instead of starting Python and loading DA3 again. The model-loading indicator is
-intentionally not a percentage bar because PyTorch/DA3 model load does not expose
+instead of starting Python and loading it again. The model-loading indicator is
+intentionally not a percentage bar because PyTorch model load does not expose
 granular progress. Model downloads still show real percent progress.
 
 The Runtime panel can open `package-report.txt` in the app data folder. That
@@ -240,14 +284,19 @@ local Python environments.
 
 ## Model And License Notes
 
-The application code is MIT licensed. The downloaded Depth Anything 3 models and
-the Depth Anything 3 project remain governed by their own licenses and
+The application code is MIT licensed. Downloaded MDA and Depth Anything models,
+checkpoints, and source projects remain governed by their own licenses and
 attribution requirements.
 
 Model pages:
 
+- https://huggingface.co/sy000/MDA
 - https://huggingface.co/depth-anything/DA3-LARGE-1.1
 - https://huggingface.co/depth-anything/DA3-SMALL
+
+MDA:
+
+- https://github.com/biansy000/MDA
 
 Depth Anything 3:
 

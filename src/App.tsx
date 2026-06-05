@@ -14,15 +14,18 @@ import {
   RotateCcw,
   Settings2,
   Square,
-  Sparkles,
   TriangleAlert,
+  X,
   XCircle
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Device = "auto" | "cuda" | "mps" | "cpu";
 type OutputFormat = "png8" | "png16" | "npy";
-type ModelRepo = "depth-anything/DA3-LARGE-1.1" | "depth-anything/DA3-SMALL";
+type ModelRepo =
+  | "sy000/MDA/mda_mog_sky_l2"
+  | "depth-anything/DA3-LARGE-1.1"
+  | "depth-anything/DA3-SMALL";
 type ResizeMode = "none" | "width" | "height" | "long";
 type ProcessResMethod =
   | "upper_bound_resize"
@@ -123,9 +126,16 @@ type PreviewImages = {
   error?: string;
 };
 
+type ImageModal = {
+  path: string;
+  title: string;
+  dataUrl?: string;
+  error?: string;
+};
+
 const defaultOptions: DepthOptions = {
   device: "auto",
-  modelRepo: "depth-anything/DA3-LARGE-1.1",
+  modelRepo: "sy000/MDA/mda_mog_sky_l2",
   outputFormat: "png8",
   generateDepth: true,
   convertWebp: false,
@@ -146,10 +156,16 @@ const defaultOptions: DepthOptions = {
 };
 
 const SETTINGS_STORAGE_KEY = "depthmapai.settings.v1";
+const MDA_DEFAULT_MIGRATION_KEY = "depthmapai.mdaDefaultMigration.v1";
 const MODEL_PROMPT_SEEN_KEY = "depthmapai.modelPromptSeen.v1";
+const APP_VERSION = "v26.6.5";
 const DEVICE_OPTIONS: Device[] = ["auto", "cuda", "mps", "cpu"];
 const OUTPUT_FORMAT_OPTIONS: OutputFormat[] = ["png8", "png16", "npy"];
-const MODEL_REPO_OPTIONS: ModelRepo[] = ["depth-anything/DA3-LARGE-1.1", "depth-anything/DA3-SMALL"];
+const MODEL_REPO_OPTIONS: ModelRepo[] = [
+  "sy000/MDA/mda_mog_sky_l2",
+  "depth-anything/DA3-LARGE-1.1",
+  "depth-anything/DA3-SMALL"
+];
 const RESIZE_MODE_OPTIONS: ResizeMode[] = ["none", "width", "height", "long"];
 const PROCESS_RES_METHOD_OPTIONS: ProcessResMethod[] = [
   "upper_bound_resize",
@@ -158,11 +174,17 @@ const PROCESS_RES_METHOD_OPTIONS: ProcessResMethod[] = [
   "lower_bound_crop"
 ];
 const MODEL_DETAILS: Record<ModelRepo, { name: string; size: string; vram: string; note: string }> = {
+  "sy000/MDA/mda_mog_sky_l2": {
+    name: "MDA-DA3-MoG-Sky",
+    size: "5.42 GB",
+    vram: "Recommended: 12 GB+ VRAM",
+    note: "Sharper edge depth and fewer flying points."
+  },
   "depth-anything/DA3-LARGE-1.1": {
     name: "DA3-LARGE-1.1",
     size: "1.64 GB",
     vram: "Recommended: 8 GB+ VRAM",
-    note: "Best quality default."
+    note: "Strong fallback with a smaller download."
   },
   "depth-anything/DA3-SMALL": {
     name: "DA3-SMALL",
@@ -228,6 +250,13 @@ function loadSavedOptions(): DepthOptions {
       loaded.normalizeLow = defaultOptions.normalizeLow;
       loaded.normalizeHigh = defaultOptions.normalizeHigh;
     }
+    if (
+      parsed.modelRepo === "depth-anything/DA3-LARGE-1.1" &&
+      window.localStorage.getItem(MDA_DEFAULT_MIGRATION_KEY) !== "done"
+    ) {
+      loaded.modelRepo = defaultOptions.modelRepo;
+      window.localStorage.setItem(MDA_DEFAULT_MIGRATION_KEY, "done");
+    }
     return loaded;
   } catch {
     return defaultOptions;
@@ -256,7 +285,7 @@ function formatVram(vram: VramStatus | null) {
 }
 
 function modelName(modelRepo: ModelRepo) {
-  return modelRepo === "depth-anything/DA3-SMALL" ? "DA3-SMALL" : "DA3-LARGE-1.1";
+  return MODEL_DETAILS[modelRepo]?.name ?? modelRepo.split("/").pop() ?? modelRepo;
 }
 
 function formatBytes(bytes: number) {
@@ -300,6 +329,7 @@ function App() {
   const [dragging, setDragging] = useState(false);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [previewImages, setPreviewImages] = useState<PreviewImages>({});
+  const [imageModal, setImageModal] = useState<ImageModal | null>(null);
   const [outputPreviews, setOutputPreviews] = useState<Record<string, string>>({});
   const [modelStatuses, setModelStatuses] = useState<Partial<Record<ModelRepo, ModelStatus>>>({});
   const [showModelPrompt, setShowModelPrompt] = useState(false);
@@ -309,6 +339,8 @@ function App() {
   const [loadedModelKey, setLoadedModelKey] = useState<string | null>(null);
   const [loadingNoise, setLoadingNoise] = useState(LOADING_NOISE[0]);
   const preloadKeyRef = useRef<string | null>(null);
+  const activePreloadKeyRef = useRef<string | null>(null);
+  const failedPreloadKeyRef = useRef<string | null>(null);
   const preloadTimerRef = useRef<number | null>(null);
 
   const completeCount = useMemo(
@@ -417,6 +449,44 @@ function App() {
     };
   }, [previewOutput, selectedItem]);
 
+  useEffect(() => {
+    if (!imageModal || imageModal.dataUrl || imageModal.error || !isTauriRuntime()) return;
+
+    let canceled = false;
+    const loadModalPreview = async () => {
+      try {
+        const dataUrl = await invoke<string>("preview_image_data_url", { path: imageModal.path });
+        if (!canceled) {
+          setImageModal((current) =>
+            current?.path === imageModal.path ? { ...current, dataUrl } : current
+          );
+        }
+      } catch (error) {
+        if (!canceled) {
+          setImageModal((current) =>
+            current?.path === imageModal.path ? { ...current, error: String(error) } : current
+          );
+        }
+      }
+    };
+
+    void loadModalPreview();
+    return () => {
+      canceled = true;
+    };
+  }, [imageModal]);
+
+  useEffect(() => {
+    if (!imageModal) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setImageModal(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [imageModal]);
+
   const refreshModelStatus = useCallback(async () => {
     if (!isTauriRuntime()) return [] as ModelStatus[];
     const statuses = await invoke<ModelStatus[]>("get_model_status");
@@ -514,6 +584,8 @@ function App() {
         preloadTimerRef.current = null;
       }
       preloadKeyRef.current = null;
+      activePreloadKeyRef.current = null;
+      failedPreloadKeyRef.current = null;
       setPreloadingModel(null);
       setLoadedModelKey(null);
       void invoke("stop_persistent_worker").catch((error) =>
@@ -532,7 +604,7 @@ function App() {
     }
 
     const preloadKey = `${options.modelRepo}:${options.device}`;
-    if (preloadKeyRef.current === preloadKey) {
+    if (preloadKeyRef.current === preloadKey || failedPreloadKeyRef.current === preloadKey) {
       return;
     }
 
@@ -548,10 +620,12 @@ function App() {
       preloadTimerRef.current = null;
       setPreloadingModel(preloadOptions.modelRepo);
       setLoadedModelKey(null);
+      activePreloadKeyRef.current = preloadKey;
       setHeadline(`Loading ${modelName(preloadOptions.modelRepo)} into memory`);
       pushLog(`Loading ${modelName(preloadOptions.modelRepo)} into memory for faster batches.`);
       void invoke("preload_model", { options: preloadOptions }).catch((error) => {
-        preloadKeyRef.current = null;
+        activePreloadKeyRef.current = null;
+        failedPreloadKeyRef.current = preloadKey;
         setPreloadingModel(null);
         setLoadedModelKey(null);
         pushLog(`Model preload failed: ${String(error)}`);
@@ -619,7 +693,7 @@ function App() {
         appDataDir: "Browser preview",
         workerPath: "Tauri runtime required"
       });
-      pushLog("Browser preview mode. Launch with Tauri to use local files and DA3.");
+      pushLog("Browser preview mode. Launch with Tauri to use local files and depth models.");
       return;
     }
 
@@ -636,6 +710,8 @@ function App() {
 
       if (payload.type === "model_ready" && payload.modelRepo) {
         setLoadedModelKey(`${payload.modelRepo}:${payload.device ?? "auto"}`);
+        activePreloadKeyRef.current = null;
+        failedPreloadKeyRef.current = null;
         setPreloadingModel(null);
       }
 
@@ -729,7 +805,12 @@ function App() {
         setPreloadingModel(null);
         if (payload.type === "error" || payload.type === "canceled") {
           setLoadedModelKey(null);
-          preloadKeyRef.current = null;
+          if (activePreloadKeyRef.current) {
+            failedPreloadKeyRef.current = activePreloadKeyRef.current;
+            activePreloadKeyRef.current = null;
+          } else {
+            preloadKeyRef.current = null;
+          }
         }
         void refreshModelStatus().catch((error) =>
           pushLog(`Could not refresh model status: ${String(error)}`)
@@ -916,6 +997,15 @@ function App() {
     }
   };
 
+  const openInputPreview = (path: string) => {
+    if (!isPreviewableImage(path)) {
+      pushLog("This input format cannot be previewed in the app.");
+      return;
+    }
+    setSelectedPath(path);
+    setImageModal({ path, title: fileName(path) });
+  };
+
   const resetSettings = () => {
     setOptions(defaultOptions);
     pushLog("Settings reset to defaults.");
@@ -1014,12 +1104,9 @@ function App() {
       <main className="app-shell">
         <aside className="sidebar">
           <div className="brand">
-            <div className="brand-mark">
-              <Sparkles size={22} />
-            </div>
             <div>
               <h1>DepthMap AI</h1>
-              <p>DA3-LARGE-1.1 local depth maps</p>
+              <p>MDA local depth maps</p>
             </div>
           </div>
 
@@ -1154,7 +1241,7 @@ function App() {
 
           <div className="split-fields">
             <label className="field">
-              <span>DA3 resolution</span>
+              <span>Depth resolution</span>
               <input
                 type="range"
                 min="336"
@@ -1183,10 +1270,10 @@ function App() {
                   }))
                 }
               >
-                <option value="upper_bound_resize">Long side</option>
-                <option value="lower_bound_resize">Short side</option>
-                <option value="upper_bound_crop">Long crop</option>
-                <option value="lower_bound_crop">Short crop</option>
+                <option value="upper_bound_resize">Long</option>
+                <option value="lower_bound_resize">Short</option>
+                <option value="upper_bound_crop">Crop L</option>
+                <option value="lower_bound_crop">Crop S</option>
               </select>
             </label>
           </div>
@@ -1282,22 +1369,23 @@ function App() {
             <span>Convert source to WebP</span>
           </label>
 
-          <label className="field compact-field">
-            <span>WebP quality</span>
-            <input
-              type="number"
-              min="1"
-              max="100"
-              disabled={!options.convertWebp}
-              value={options.webpQuality}
-              onChange={(event) =>
-                setOptions((current) => ({
-                  ...current,
-                  webpQuality: Number(event.target.value) || current.webpQuality
-                }))
-              }
-            />
-          </label>
+          {options.convertWebp ? (
+            <label className="field compact-field">
+              <span>WebP quality</span>
+              <input
+                type="number"
+                min="1"
+                max="100"
+                value={options.webpQuality}
+                onChange={(event) =>
+                  setOptions((current) => ({
+                    ...current,
+                    webpQuality: Number(event.target.value) || current.webpQuality
+                  }))
+                }
+              />
+            </label>
+          ) : null}
 
           <label className="toggle">
             <input
@@ -1344,6 +1432,7 @@ function App() {
                 }))
               }
             >
+              <option value="sy000/MDA/mda_mog_sky_l2">MDA-DA3-MoG-Sky</option>
               <option value="depth-anything/DA3-LARGE-1.1">DA3-LARGE-1.1</option>
               <option value="depth-anything/DA3-SMALL">DA3-SMALL</option>
             </select>
@@ -1370,15 +1459,18 @@ function App() {
                 ? `${modelName(options.modelRepo)} is installed.`
                 : `${modelName(options.modelRepo)} downloads when needed.`}
           </p>
-          <button className="secondary folder-button" onClick={openModelFolder}>
-            <FolderOpen size={16} />
-            Model folder
-          </button>
-          <button className="secondary folder-button" onClick={openPackageReport}>
-            <Package size={16} />
-            Packages
-          </button>
+          <div className="runtime-actions">
+            <button className="secondary folder-button" onClick={openModelFolder}>
+              <FolderOpen size={16} />
+              Models
+            </button>
+            <button className="secondary folder-button" onClick={openPackageReport}>
+              <Package size={16} />
+              Packages
+            </button>
+          </div>
           </section>
+          <div className="app-version">{APP_VERSION}</div>
         </aside>
 
         <section className="workspace">
@@ -1465,7 +1557,7 @@ function App() {
           <section className="model-load-status">
             <div>
               <strong>Loading {modelName(activeModelLoad)} into memory</strong>
-              <small>Keeping DA3 warm for faster repeat batches</small>
+              <small>Keeping the model warm for faster repeat batches</small>
             </div>
             <code aria-label="Model loading indicator">{loadingNoise}</code>
           </section>
@@ -1536,8 +1628,17 @@ function App() {
                 tabIndex={0}
               >
                 <div className="queue-input">
-                  <strong>{fileName(item.path)}</strong>
-                  <small>{item.path}</small>
+                  <button
+                    className="input-preview-button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openInputPreview(item.path);
+                    }}
+                    title="Open larger input preview"
+                  >
+                    <strong>{fileName(item.path)}</strong>
+                    <small>{item.path}</small>
+                  </button>
                 </div>
                 <div className="status">
                   {statusIcon(item.status)}
@@ -1626,6 +1727,41 @@ function App() {
                 )
               )}
             </div>
+          </section>
+        </div>
+      ) : null}
+      {imageModal ? (
+        <div
+          className="modal-backdrop image-modal-backdrop"
+          role="presentation"
+          onClick={() => setImageModal(null)}
+        >
+          <section
+            className="image-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="input-preview-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading image-modal-heading">
+              <div>
+                <p className="eyebrow">Input preview</p>
+                <h3 id="input-preview-title">{imageModal.title}</h3>
+              </div>
+              <button className="secondary icon" onClick={() => setImageModal(null)} title="Close preview">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="image-modal-frame">
+              {imageModal.dataUrl ? (
+                <img src={imageModal.dataUrl} alt="" />
+              ) : imageModal.error ? (
+                <div className="preview-empty">{imageModal.error}</div>
+              ) : (
+                <div className="preview-empty">Loading</div>
+              )}
+            </div>
+            <small className="image-modal-path">{imageModal.path}</small>
           </section>
         </div>
       ) : null}

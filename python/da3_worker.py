@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import platform
 import re
@@ -10,20 +11,56 @@ import subprocess
 import sys
 import threading
 import venv
+import zipfile
 from pathlib import Path
 from typing import Any
 from tempfile import TemporaryDirectory
 
 
-DEFAULT_MODEL_REPO = "depth-anything/DA3-LARGE-1.1"
-DA3_REPO = "git+https://github.com/ByteDance-Seed/depth-anything-3.git"
-DEPTH_DEPS_MARKER = ".depthmapai-depth-deps-v2-ready"
+MDA_MODEL_REPO = "sy000/MDA/mda_mog_sky_l2"
+DEFAULT_MODEL_REPO = MDA_MODEL_REPO
+DA3_COMMIT = "41736238f5bced4debf3f2a12375d2466874866d"
+DA3_REPO = f"git+https://github.com/ByteDance-Seed/depth-anything-3.git@{DA3_COMMIT}"
+MDA_HF_REPO = "sy000/MDA"
+MDA_CHECKPOINT_FILENAME = "DA3_MOG_Sky_LogL2.ckpt"
+MDA_MODEL_NAME = "mda_mog_sky_l2"
+MDA_SOURCE_COMMIT = "0a4ae22e6994a9794dfb24a1275c7fbf59112f2a"
+MDA_SOURCE_URL = f"https://github.com/biansy000/MDA/archive/{MDA_SOURCE_COMMIT}.zip"
+DEPTH_DEPS_MARKER = ".depthmapai-depth-deps-v4-ready"
+MDA_DEPS_MARKER = ".depthmapai-mda-deps-v2-ready"
+PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+BOOTSTRAP_PACKAGES = ["pip==26.1.1", "setuptools==70.2.0", "wheel==0.47.0"]
+WEBP_PACKAGES = ["pillow==12.2.0"]
+ML_PACKAGES = [
+    "huggingface_hub==1.15.0",
+    "requests==2.34.2",
+    "numpy==1.26.4",
+    "pillow==12.2.0",
+    "opencv-python==4.11.0.86",
+    "safetensors==0.7.0",
+    "addict==2.4.0",
+]
+PYTORCH_CPU_PACKAGES = ["torch==2.11.0", "torchvision==0.26.0"]
+PYTORCH_CUDA_PACKAGES = ["torch==2.11.0+cu128", "torchvision==0.26.0+cu128"]
+MDA_RUNTIME_PACKAGES = [
+    "PyYAML==6.0.3",
+    "omegaconf==2.3.0",
+    "einops==0.8.2",
+    "scipy==1.17.1",
+    "tqdm==4.67.3",
+    "sympy==1.14.0",
+    "lightning-bolts==0.7.0",
+]
 MODEL_SIZES = {
+    MDA_MODEL_REPO: 5_423_360_059,
     "depth-anything/DA3-LARGE-1.1": 1_643_843_860,
     "depth-anything/DA3-SMALL": 137_000_000,
 }
 MODEL_SIDE_FILES = (".gitattributes", "README.md", "config.json")
 PYTHON_VERSION_RE = re.compile(r"Python\s+(\d+)\.(\d+)\.(\d+)")
+MDA_ACTIVE_PATHS: list[str] = []
+os.environ.setdefault("XFORMERS_FORCE_DISABLE_TRITON", "1")
+logging.getLogger("xformers").setLevel(logging.ERROR)
 
 
 def emit(event_type: str, message: str | None = None, **payload: Any) -> None:
@@ -112,6 +149,23 @@ def python_version(python_path: Path) -> tuple[int, int, int] | None:
     return parse_python_version(output)
 
 
+def nvidia_smi_available() -> bool:
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except Exception:
+        return False
+    return True
+
+
 def ensure_env(env_dir: Path, need_depth: bool) -> Path:
     python_path = venv_python(env_dir)
     if python_path.exists() and not supported_python_version(python_version(python_path)):
@@ -141,37 +195,163 @@ def ensure_env(env_dir: Path, need_depth: bool) -> Path:
         return python_path
 
     pip = [str(python_path), "-m", "pip"]
-    run_checked(pip + ["install", "--upgrade", "pip", "setuptools", "wheel"], "Updating pip")
+    run_checked(pip + ["install", "--upgrade", *BOOTSTRAP_PACKAGES], "Updating pip")
     if not webp_marker.exists():
-        run_checked(pip + ["install", "pillow"], "Installing WebP conversion package")
+        run_checked(pip + ["install", *WEBP_PACKAGES], "Installing WebP conversion package")
         webp_marker.write_text("ok\n", encoding="utf-8")
     if need_depth and not depth_deps_marker.exists():
+        has_nvidia_gpu = nvidia_smi_available()
+        torch_install = [
+            "install",
+            "--upgrade",
+            *(PYTORCH_CUDA_PACKAGES if has_nvidia_gpu else PYTORCH_CPU_PACKAGES),
+        ]
+        if has_nvidia_gpu:
+            torch_install += ["--force-reinstall", "--index-url", PYTORCH_CUDA_INDEX_URL]
+
         run_checked(
-            pip
-            + [
-                "install",
-                "torch>=2",
-                "torchvision",
-                "huggingface_hub",
-                "requests",
-                "numpy<2",
-                "pillow",
-                "opencv-python",
-                "safetensors",
-                "addict",
-            ],
+            pip + ["install", *ML_PACKAGES],
             "Installing ML runtime packages",
         )
+        run_checked(
+            pip + torch_install,
+            "Installing CUDA PyTorch packages" if has_nvidia_gpu else "Installing PyTorch packages",
+        )
+        run_checked(pip + ["install", "--upgrade", "numpy==1.26.4"], "Pinning compatible NumPy")
         run_checked(pip + ["install", DA3_REPO], "Installing Depth Anything 3")
         depth_marker.write_text("ok\n", encoding="utf-8")
         depth_deps_marker.write_text("ok\n", encoding="utf-8")
     return python_path
 
 
+def is_mda_model(model_repo: str) -> bool:
+    return model_repo == MDA_MODEL_REPO
+
+
+def model_display_name(model_repo: str) -> str:
+    if is_mda_model(model_repo):
+        return "MDA-DA3-MoG-Sky"
+    return model_repo.split("/")[-1]
+
+
+def ensure_mda_python_deps(env_dir: Path) -> None:
+    marker = env_dir / MDA_DEPS_MARKER
+    if marker.exists():
+        return
+    pip = [sys.executable, "-m", "pip"]
+    run_checked(
+        pip
+        + ["install", *MDA_RUNTIME_PACKAGES],
+        "Installing MDA runtime packages",
+    )
+    marker.write_text("ok\n", encoding="utf-8")
+
+
+def ensure_mda_source(model_dir: Path) -> Path:
+    import requests
+
+    source_dir = model_dir / "source"
+    if (source_dir / "demo.py").exists() and (source_dir / "src" / "testing" / "utils" / "model_choice.py").exists():
+        return source_dir
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    incomplete_dir = model_dir / "source.incomplete"
+    shutil.rmtree(incomplete_dir, ignore_errors=True)
+
+    emit("setup", "Downloading MDA source")
+    with TemporaryDirectory(prefix="depthmapai-mda-source-") as temp:
+        archive_path = Path(temp) / "mda.zip"
+        with requests.get(MDA_SOURCE_URL, stream=True, timeout=60) as response:
+            response.raise_for_status()
+            with archive_path.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(incomplete_dir)
+
+    roots = [path for path in incomplete_dir.iterdir() if path.is_dir()]
+    if len(roots) != 1:
+        shutil.rmtree(incomplete_dir, ignore_errors=True)
+        raise RuntimeError("Downloaded MDA source archive had an unexpected layout.")
+
+    shutil.rmtree(source_dir, ignore_errors=True)
+    roots[0].replace(source_dir)
+    shutil.rmtree(incomplete_dir, ignore_errors=True)
+    return source_dir
+
+
+def ensure_mda_checkpoint(model_dir: Path) -> Path:
+    from huggingface_hub import hf_hub_download
+
+    source_dir = ensure_mda_source(model_dir)
+    checkpoint_dir = source_dir / "checkpoints" / "MDA"
+    checkpoint_path = checkpoint_dir / MDA_CHECKPOINT_FILENAME
+    if checkpoint_path.exists():
+        emit_download_progress(
+            MDA_MODEL_REPO,
+            checkpoint_path.stat().st_size,
+            checkpoint_path.stat().st_size,
+            f"{model_display_name(MDA_MODEL_REPO)} already installed",
+        )
+        return checkpoint_path
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    emit_download_progress(
+        MDA_MODEL_REPO,
+        0,
+        MODEL_SIZES[MDA_MODEL_REPO],
+        f"Downloading {model_display_name(MDA_MODEL_REPO)}",
+    )
+    hf_hub_download(
+        repo_id=MDA_HF_REPO,
+        filename=MDA_CHECKPOINT_FILENAME,
+        local_dir=str(checkpoint_dir),
+        local_dir_use_symlinks=False,
+    )
+    if not checkpoint_path.exists():
+        raise RuntimeError(f"MDA checkpoint download did not create {checkpoint_path}")
+    emit_download_progress(
+        MDA_MODEL_REPO,
+        checkpoint_path.stat().st_size,
+        checkpoint_path.stat().st_size,
+        f"Downloaded {model_display_name(MDA_MODEL_REPO)}",
+    )
+    return checkpoint_path
+
+
+def clear_depth_modules() -> None:
+    prefixes = ("depth_anything_3", "src.depth_anything_3", "src.training", "src.testing", "src.stream3r")
+    for name in list(sys.modules):
+        if name in prefixes or any(name.startswith(f"{prefix}.") for prefix in prefixes):
+            sys.modules.pop(name, None)
+
+
+def deactivate_mda_source() -> None:
+    global MDA_ACTIVE_PATHS
+    if not MDA_ACTIVE_PATHS:
+        return
+    active = {str(Path(path)) for path in MDA_ACTIVE_PATHS}
+    sys.path[:] = [path for path in sys.path if str(Path(path)) not in active]
+    MDA_ACTIVE_PATHS = []
+    clear_depth_modules()
+
+
+def activate_mda_source(source_dir: Path) -> None:
+    global MDA_ACTIVE_PATHS
+    deactivate_mda_source()
+    paths = [str(source_dir), str(source_dir / "src")]
+    for path in reversed(paths):
+        sys.path.insert(0, path)
+    MDA_ACTIVE_PATHS = paths
+    clear_depth_modules()
+
+
 def relaunch_in_env(job_path: Path, env_dir: Path, need_depth: bool, daemon: bool) -> int:
     python_path = ensure_env(env_dir, need_depth)
     env = os.environ.copy()
     env["DEPTHMAPAI_VENV_ACTIVE"] = "1"
+    env.setdefault("XFORMERS_FORCE_DISABLE_TRITON", "1")
     args = [str(python_path), str(Path(__file__).resolve())]
     if daemon:
         args.append("--daemon")
@@ -450,9 +630,13 @@ def download_model_file(model_repo: str, model_dir: Path) -> None:
 
 
 def ensure_model(model_repo: str, model_dir: Path) -> Path:
+    if is_mda_model(model_repo):
+        ensure_mda_checkpoint(model_dir)
+        return model_dir
+
     model_file = model_dir / "model.safetensors"
     if model_file.exists():
-        emit_download_progress(model_repo, model_file.stat().st_size, model_file.stat().st_size, f"{model_repo.split('/')[-1]} already installed")
+        emit_download_progress(model_repo, model_file.stat().st_size, model_file.stat().st_size, f"{model_display_name(model_repo)} already installed")
         return model_dir
 
     from huggingface_hub import hf_hub_download
@@ -471,6 +655,81 @@ def ensure_model(model_repo: str, model_dir: Path) -> Path:
             emit("setup", f"Skipped {filename}: {error}")
     download_model_file(model_repo, model_dir)
     return model_dir
+
+
+def prepare_mda_view(image_path: Path, size: int, patch_size: int, img_norm: Any) -> tuple[list[dict[str, Any]], tuple[int, int]]:
+    import numpy as np
+    import torch
+    from PIL import Image
+    from PIL.ImageOps import exif_transpose
+
+    with Image.open(image_path) as opened:
+        image = exif_transpose(opened).convert("RGB")
+        original_size = image.size
+        width, height = image.size
+        scale = max(1, int(size)) / max(width, height)
+        resized_size = (
+            max(patch_size, int(round(width * scale))),
+            max(patch_size, int(round(height * scale))),
+        )
+        image = image.resize(resized_size, Image.Resampling.BICUBIC)
+
+    target_width = max(patch_size, (image.size[0] // patch_size) * patch_size)
+    target_height = max(patch_size, (image.size[1] // patch_size) * patch_size)
+    if image.size != (target_width, target_height):
+        image = image.resize((target_width, target_height), Image.Resampling.BICUBIC)
+
+    tensor = img_norm(image)[None]
+    view = {
+        "img": tensor,
+        "ray_map": torch.full((tensor.shape[0], 6, tensor.shape[-2], tensor.shape[-1]), torch.nan),
+        "true_shape": torch.from_numpy(np.int32([[tensor.shape[-2], tensor.shape[-1]]])),
+        "idx": 0,
+        "instance": "0",
+        "camera_pose": torch.from_numpy(np.eye(4).astype(np.float32)).unsqueeze(0),
+        "img_mask": torch.tensor(True).unsqueeze(0),
+        "ray_mask": torch.tensor(False).unsqueeze(0),
+        "update": torch.tensor(True).unsqueeze(0),
+        "reset": torch.tensor(False).unsqueeze(0),
+    }
+    return [view], original_size
+
+
+def mda_depth_for_image(torch: Any, loaded: Any, image_path: Path, options: dict[str, Any], device: Any) -> Any:
+    views, original_size = prepare_mda_view(
+        image_path,
+        int(options.get("processRes", 504)),
+        int(getattr(loaded, "patch_size", 14)),
+        loaded.img_norm,
+    )
+    with torch.enable_grad():
+        prediction = loaded.model.inference(
+            views,
+            device,
+            is_mog=True,
+            use_sky_mask=True,
+            crop_center_112=False,
+            cam_inp=False,
+            gt_cam_output=False,
+            output_normalize=False,
+        )
+    try:
+        loaded.model.zero_grad(set_to_none=True)
+    except Exception:
+        pass
+    depth = prediction["depth"]
+    if depth.ndim == 5:
+        depth = depth.squeeze(0).squeeze(-1)
+    else:
+        depth = depth.squeeze(0)
+    depth = depth[0].float().unsqueeze(0).unsqueeze(0)
+    depth = torch.nn.functional.interpolate(
+        depth,
+        size=(original_size[1], original_size[0]),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return depth[0, 0].detach().cpu().numpy()
 
 
 class ModelCache:
@@ -492,11 +751,10 @@ class ModelCache:
         self.model_repo = None
         self.device = None
 
-    def load(self, options: dict[str, Any], model_dir: Path) -> tuple[Any, Any]:
+    def load(self, options: dict[str, Any], model_dir: Path, env_dir: Path | None = None) -> tuple[Any, Any]:
         model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
-        emit("model", f"Preparing {model_repo.split('/')[-1]} runtime")
+        emit("model", f"Preparing {model_display_name(model_repo)} runtime")
         import torch as torch_module
-        from depth_anything_3.api import DepthAnything3
 
         device = choose_device(options["device"])
         device_key = str(device)
@@ -509,18 +767,40 @@ class ModelCache:
         ):
             emit(
                 "model_ready",
-                f"{model_repo.split('/')[-1]} is already loaded on {device_key}.",
+                f"{model_display_name(model_repo)} is already loaded on {device_key}.",
                 modelRepo=model_repo,
                 device=device_key,
             )
             return self.torch, self.model
 
         self.clear()
-        resolved_model_dir = ensure_model(model_repo, model_dir)
-        emit("model", f"Loading {model_repo.split('/')[-1]} on {device_key}", modelRepo=model_repo, device=device_key)
-        model = DepthAnything3.from_pretrained(str(resolved_model_dir))
-        model = model.to(device=device)
-        model.eval()
+        if is_mda_model(model_repo):
+            if env_dir is not None:
+                ensure_mda_python_deps(env_dir)
+            ensure_mda_checkpoint(model_dir)
+            source_dir = ensure_mda_source(model_dir)
+            activate_mda_source(source_dir)
+            import importlib
+
+            model_choice = importlib.import_module("src.testing.utils.model_choice")
+            model_choice.device = device
+            emit("model", f"Loading {model_display_name(model_repo)} on {device_key}", modelRepo=model_repo, device=device_key)
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(source_dir)
+                model = model_choice.choose_model(MDA_MODEL_NAME)
+            finally:
+                os.chdir(previous_cwd)
+            model = model._replace(model=model.model.to(device=device).eval())
+        else:
+            deactivate_mda_source()
+            from depth_anything_3.api import DepthAnything3
+
+            resolved_model_dir = ensure_model(model_repo, model_dir)
+            emit("model", f"Loading {model_display_name(model_repo)} on {device_key}", modelRepo=model_repo, device=device_key)
+            model = DepthAnything3.from_pretrained(str(resolved_model_dir))
+            model = model.to(device=device)
+            model.eval()
 
         self.torch = torch_module
         self.model = model
@@ -528,7 +808,7 @@ class ModelCache:
         self.device = device_key
         emit(
             "model_ready",
-            f"{model_repo.split('/')[-1]} loaded on {device_key}.",
+            f"{model_display_name(model_repo)} loaded on {device_key}.",
             modelRepo=model_repo,
             device=device_key,
         )
@@ -538,18 +818,21 @@ class ModelCache:
 def warm_model(torch: Any, model: Any, options: dict[str, Any]) -> None:
     from PIL import Image
 
+    model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
     emit("model", "Warming model on a tiny test image")
     with TemporaryDirectory(prefix="depthmapai-warm-") as temp:
         warm_path = Path(temp) / "warmup.png"
         Image.new("RGB", (64, 64), (0, 0, 0)).save(warm_path)
-        with torch.inference_mode():
-            model.inference(
-                [str(warm_path)],
-                process_res=336,
-                process_res_method=options.get("processResMethod", "upper_bound_resize"),
-            )
-    model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
-    emit("model_ready", f"{model_repo.split('/')[-1]} warmed and ready.", modelRepo=model_repo)
+        if is_mda_model(model_repo):
+            mda_depth_for_image(torch, model, warm_path, {**options, "processRes": 112}, choose_device(options["device"]))
+        else:
+            with torch.inference_mode():
+                model.inference(
+                    [str(warm_path)],
+                    process_res=336,
+                    process_res_method=options.get("processResMethod", "upper_bound_resize"),
+                )
+    emit("model_ready", f"{model_display_name(model_repo)} warmed and ready.", modelRepo=model_repo)
 
 
 def run_job(job: dict[str, Any], cache: ModelCache | None = None) -> None:
@@ -568,15 +851,15 @@ def run_job(job: dict[str, Any], cache: ModelCache | None = None) -> None:
             emit("done", "Depth generation is disabled; model preload skipped.")
             return
         model_cache = cache or ModelCache()
-        torch, model = model_cache.load(options, Path(job["model_dir"]))
+        torch, model = model_cache.load(options, Path(job["model_dir"]), Path(job["env_dir"]))
         warm_model(torch, model, options)
-        emit("done", f"{options.get('modelRepo', DEFAULT_MODEL_REPO).split('/')[-1]} is loaded and ready.")
+        emit("done", f"{model_display_name(options.get('modelRepo', DEFAULT_MODEL_REPO))} is loaded and ready.")
         return
 
     if download_only:
         model_repo = options.get("modelRepo", DEFAULT_MODEL_REPO)
         ensure_model(model_repo, Path(job["model_dir"]))
-        emit("done", f"{model_repo.split('/')[-1]} is ready.")
+        emit("done", f"{model_display_name(model_repo)} is ready.")
         return
 
     if not generate_depth and not convert_webp:
@@ -584,7 +867,7 @@ def run_job(job: dict[str, Any], cache: ModelCache | None = None) -> None:
 
     if generate_depth:
         model_cache = cache or ModelCache()
-        torch, model = model_cache.load(options, Path(job["model_dir"]))
+        torch, model = model_cache.load(options, Path(job["model_dir"]), Path(job["env_dir"]))
 
     for image_path in paths:
         output_path = output_path_for(
@@ -613,14 +896,18 @@ def run_job(job: dict[str, Any], cache: ModelCache | None = None) -> None:
                 assert model is not None
                 with TemporaryDirectory(prefix="depthmapai-") as temp:
                     inference_path = resized_input_for(image_path, options, Path(temp))
-                    with torch.inference_mode():
-                        prediction = model.inference(
-                            [str(inference_path)],
-                            process_res=int(options.get("processRes", 504)),
-                            process_res_method=options.get("processResMethod", "upper_bound_resize"),
-                        )
+                    if is_mda_model(options.get("modelRepo", DEFAULT_MODEL_REPO)):
+                        depth = mda_depth_for_image(torch, model, inference_path, options, choose_device(options["device"]))
+                    else:
+                        with torch.inference_mode():
+                            prediction = model.inference(
+                                [str(inference_path)],
+                                process_res=int(options.get("processRes", 504)),
+                                process_res_method=options.get("processResMethod", "upper_bound_resize"),
+                            )
+                            depth = prediction.depth[0]
                 save_depth(
-                    prediction.depth[0],
+                    depth,
                     output_path,
                     options["outputFormat"],
                     bool(options["invert"]),

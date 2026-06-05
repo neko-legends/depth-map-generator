@@ -22,6 +22,7 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 ];
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const EMBEDDED_WORKER: &str = include_str!("../../python/da3_worker.py");
 
 #[derive(Debug, Serialize)]
 struct RuntimeStatus {
@@ -218,25 +219,48 @@ fn worker_path(app: &AppHandle) -> Result<PathBuf, String> {
         resource_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from("."))
+            .join("_up_")
+            .join("python")
+            .join("da3_worker.py"),
+        resource_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."))
             .join("python")
             .join("da3_worker.py"),
         resource_dir
             .unwrap_or_else(|| PathBuf::from("."))
             .join("da3_worker.py"),
     ];
+    let checked = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    candidates
-        .into_iter()
-        .find(|path| path.exists())
-        .ok_or_else(|| {
-            format!(
-                "Could not find python/da3_worker.py from {}",
-                app.path()
-                    .app_data_dir()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|_| "unknown app data dir".to_string())
-            )
-        })
+    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+        return Ok(path);
+    }
+
+    write_embedded_worker(app).map_err(|error| {
+        format!(
+            "Could not find python/da3_worker.py. Checked: {checked}. Embedded fallback failed: {error}"
+        )
+    })
+}
+
+fn write_embedded_worker(app: &AppHandle) -> Result<PathBuf, String> {
+    let worker_dir = app_data_dir(app)?.join("python");
+    fs::create_dir_all(&worker_dir)
+        .map_err(|error| format!("Unable to create embedded worker dir: {error}"))?;
+    let worker = worker_dir.join("da3_worker.py");
+    let needs_write = fs::read_to_string(&worker)
+        .map(|content| content != EMBEDDED_WORKER)
+        .unwrap_or(true);
+    if needs_write {
+        fs::write(&worker, EMBEDDED_WORKER)
+            .map_err(|error| format!("Unable to write embedded worker: {error}"))?;
+    }
+    Ok(worker)
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -439,6 +463,7 @@ fn collect_images(path: &Path, recursive: bool, output: &mut Vec<String>) {
 
 fn model_cache_name(model_repo: &str) -> Result<&'static str, String> {
     match model_repo {
+        "sy000/MDA/mda_mog_sky_l2" => Ok("MDA-DA3-MoG-Sky"),
         "depth-anything/DA3-LARGE-1.1" => Ok("DA3-LARGE-1.1"),
         "depth-anything/DA3-SMALL" => Ok("DA3-SMALL"),
         _ => Err(format!("Unsupported depth model: {model_repo}")),
@@ -447,18 +472,37 @@ fn model_cache_name(model_repo: &str) -> Result<&'static str, String> {
 
 fn model_size_bytes(model_repo: &str) -> Result<u64, String> {
     match model_repo {
+        "sy000/MDA/mda_mog_sky_l2" => Ok(5_423_360_059),
         "depth-anything/DA3-LARGE-1.1" => Ok(1_643_843_860),
         "depth-anything/DA3-SMALL" => Ok(137_000_000),
         _ => Err(format!("Unsupported depth model: {model_repo}")),
     }
 }
 
-fn supported_models() -> [&'static str; 2] {
-    ["depth-anything/DA3-LARGE-1.1", "depth-anything/DA3-SMALL"]
+fn supported_models() -> [&'static str; 3] {
+    [
+        "sy000/MDA/mda_mog_sky_l2",
+        "depth-anything/DA3-LARGE-1.1",
+        "depth-anything/DA3-SMALL",
+    ]
 }
 
 fn model_dir_for(app_data: &Path, model_repo: &str) -> Result<PathBuf, String> {
     Ok(app_data.join("models").join(model_cache_name(model_repo)?))
+}
+
+fn model_file_for(model_dir: &Path, model_repo: &str) -> Result<PathBuf, String> {
+    match model_repo {
+        "sy000/MDA/mda_mog_sky_l2" => Ok(model_dir
+            .join("source")
+            .join("checkpoints")
+            .join("MDA")
+            .join("DA3_MOG_Sky_LogL2.ckpt")),
+        "depth-anything/DA3-LARGE-1.1" | "depth-anything/DA3-SMALL" => {
+            Ok(model_dir.join("model.safetensors"))
+        }
+        _ => Err(format!("Unsupported depth model: {model_repo}")),
+    }
 }
 
 fn terminal_worker_event(value: &serde_json::Value) -> bool {
@@ -488,14 +532,14 @@ fn persistent_worker(
     let app_data = app_data_dir(app)?;
     let jobs_dir = app_data.join("jobs");
     let env_dir = app_data.join("python-env");
-    let model_dir = model_dir_for(&app_data, "depth-anything/DA3-LARGE-1.1")?;
+    let model_dir = model_dir_for(&app_data, "sy000/MDA/mda_mog_sky_l2")?;
     fs::create_dir_all(&jobs_dir).map_err(|error| format!("Unable to create jobs dir: {error}"))?;
 
     let job_id = Uuid::new_v4().to_string();
     let job_path = jobs_dir.join(format!("persistent-{job_id}.json"));
     let options = DepthOptions {
         device: "auto".to_string(),
-        model_repo: "depth-anything/DA3-LARGE-1.1".to_string(),
+        model_repo: "sy000/MDA/mda_mog_sky_l2".to_string(),
         output_format: "png8".to_string(),
         generate_depth: true,
         convert_webp: false,
@@ -723,7 +767,7 @@ fn get_model_status(app: AppHandle) -> Result<Vec<ModelStatus>, String> {
         .into_iter()
         .map(|repo| {
             let model_dir = model_dir_for(&app_data, repo)?;
-            let model_path = model_dir.join("model.safetensors");
+            let model_path = model_file_for(&model_dir, repo)?;
             Ok(ModelStatus {
                 repo: repo.to_string(),
                 name: model_cache_name(repo)?.to_string(),
@@ -769,16 +813,25 @@ Direct install commands used by the app
 ---------------------------------------
 
 Base setup:
-python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade pip==26.1.1 setuptools==70.2.0 wheel==0.47.0
 
 WebP conversion:
-python -m pip install pillow
+python -m pip install pillow==12.2.0
 
 Depth generation:
-python -m pip install torch>=2 torchvision huggingface_hub requests numpy<2 pillow opencv-python safetensors addict
-python -m pip install git+https://github.com/ByteDance-Seed/depth-anything-3.git
+python -m pip install huggingface_hub==1.15.0 requests==2.34.2 numpy==1.26.4 pillow==12.2.0 opencv-python==4.11.0.86 safetensors==0.7.0 addict==2.4.0
+python -m pip install --upgrade torch==2.11.0 torchvision==0.26.0
+NVIDIA machines:
+python -m pip install --upgrade --force-reinstall torch==2.11.0+cu128 torchvision==0.26.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --upgrade numpy==1.26.4
+python -m pip install git+https://github.com/ByteDance-Seed/depth-anything-3.git@41736238f5bced4debf3f2a12375d2466874866d
+
+MDA runtime, installed only when the MDA model is selected:
+python -m pip install PyYAML==6.0.3 omegaconf==2.3.0 einops==0.8.2 scipy==1.17.1 tqdm==4.67.3 sympy==1.14.0 lightning-bolts==0.7.0
 
 Model files are downloaded separately from:
+- https://huggingface.co/sy000/MDA
+- https://github.com/biansy000/MDA/archive/0a4ae22e6994a9794dfb24a1275c7fbf59112f2a.zip
 - https://huggingface.co/depth-anything/DA3-LARGE-1.1
 - https://huggingface.co/depth-anything/DA3-SMALL
 
