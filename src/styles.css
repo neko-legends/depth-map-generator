@@ -63,13 +63,13 @@ button {
   overflow-y: auto;
   border-right: 1px solid rgba(255, 138, 42, 0.18);
   background: rgba(8, 7, 6, 0.82);
-  padding: 16px 16px 10px;
+  padding: 14px 16px 8px;
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 138, 42, 0.45) transparent;
 }
 
 .brand {
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 
 h1,
@@ -111,8 +111,8 @@ small,
 .app-version {
   position: sticky;
   bottom: 0;
-  margin-top: 10px;
-  padding: 5px 0 0;
+  margin-top: 7px;
+  padding: 4px 0 0;
   color: #7c6f64;
   background: rgba(8, 7, 6, 0.9);
   font-size: 11px;
@@ -122,14 +122,14 @@ small,
 
 .panel,
 .runtime {
-  padding: 12px;
+  padding: 11px;
   border: 1px solid rgba(255, 138, 42, 0.16);
   border-radius: 8px;
   background: rgba(18, 13, 9, 0.74);
 }
 
 .runtime {
-  margin-top: 10px;
+  margin-top: 8px;
 }
 
 .runtime-model {
@@ -199,7 +199,7 @@ small,
 .field {
   display: grid;
   gap: 4px;
-  margin-bottom: 7px;
+  margin-bottom: 6px;
 }
 
 .split-fields {
@@ -351,7 +351,7 @@ select:disabled {
   display: flex;
   align-items: center;
   gap: 9px;
-  margin-top: 6px;
+  margin-top: 5px;
 }
 
 .toggle input {
