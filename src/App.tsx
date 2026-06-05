@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type Device = "auto" | "cuda" | "mps" | "cpu";
+type Device = "auto" | "cuda" | "mps" | "cpu" | `cuda:${number}`;
 type OutputFormat = "png8" | "png16" | "npy";
 type ModelRepo =
   | "sy000/MDA/mda_mog_sky_l2"
@@ -154,11 +154,12 @@ const defaultOptions: DepthOptions = {
   normalizeLow: 1,
   normalizeHigh: 99,
   depthGamma: 1,
-  keepModelLoaded: true
+  keepModelLoaded: false
 };
 
 const SETTINGS_STORAGE_KEY = "depthmapai.settings.v1";
 const MDA_DEFAULT_MIGRATION_KEY = "depthmapai.mdaDefaultMigration.v1";
+const KEEP_LOADED_DEFAULT_MIGRATION_KEY = "depthmapai.keepLoadedDefaultMigration.v1";
 const MODEL_PROMPT_SEEN_KEY = "depthmapai.modelPromptSeen.v1";
 const APP_VERSION = "v26.6.5";
 const DEVICE_OPTIONS: Device[] = ["auto", "cuda", "mps", "cpu"];
@@ -204,6 +205,12 @@ function coerceChoice<T extends string>(value: unknown, choices: T[], fallback: 
   return typeof value === "string" && choices.includes(value as T) ? (value as T) : fallback;
 }
 
+function coerceDevice(value: unknown, fallback: Device) {
+  if (typeof value !== "string") return fallback;
+  if (DEVICE_OPTIONS.includes(value as Device) || /^cuda:\d+$/.test(value)) return value as Device;
+  return fallback;
+}
+
 function coerceBoolean(value: unknown, fallback: boolean) {
   return typeof value === "boolean" ? value : fallback;
 }
@@ -224,7 +231,7 @@ function loadSavedOptions(): DepthOptions {
     if (!parsedValue || typeof parsedValue !== "object") return defaultOptions;
     const parsed = parsedValue as Partial<DepthOptions>;
     const loaded = {
-      device: coerceChoice(parsed.device, DEVICE_OPTIONS, defaultOptions.device),
+      device: coerceDevice(parsed.device, defaultOptions.device),
       modelRepo: coerceChoice(parsed.modelRepo, MODEL_REPO_OPTIONS, defaultOptions.modelRepo),
       outputFormat: coerceChoice(parsed.outputFormat, OUTPUT_FORMAT_OPTIONS, defaultOptions.outputFormat),
       generateDepth: coerceBoolean(parsed.generateDepth, defaultOptions.generateDepth),
@@ -263,6 +270,10 @@ function loadSavedOptions(): DepthOptions {
       loaded.modelRepo = defaultOptions.modelRepo;
       window.localStorage.setItem(MDA_DEFAULT_MIGRATION_KEY, "done");
     }
+    if (window.localStorage.getItem(KEEP_LOADED_DEFAULT_MIGRATION_KEY) !== "done") {
+      loaded.keepModelLoaded = defaultOptions.keepModelLoaded;
+      window.localStorage.setItem(KEEP_LOADED_DEFAULT_MIGRATION_KEY, "done");
+    }
     return loaded;
   } catch {
     return defaultOptions;
@@ -288,6 +299,19 @@ function formatVram(vram: VramStatus | null) {
     value: `${(used / 1024).toFixed(1)}/${(total / 1024).toFixed(1)} GB`,
     label: gpuLabel
   };
+}
+
+function gpuDeviceOptions(vram: VramStatus | null): Array<{ value: Device; label: string }> {
+  const options: Array<{ value: Device; label: string }> = [{ value: "auto", label: "Auto" }];
+  if (vram?.available && vram.gpus.length > 0) {
+    vram.gpus.forEach((gpu, index) => {
+      options.push({ value: `cuda:${index}` as Device, label: `GPU ${index} - ${gpu.name}` });
+    });
+  } else {
+    options.push({ value: "cuda", label: "CUDA" });
+  }
+  options.push({ value: "cpu", label: "CPU" });
+  return options;
 }
 
 function modelName(modelRepo: ModelRepo) {
@@ -350,6 +374,7 @@ function App() {
   const preloadTimerRef = useRef<number | null>(null);
   const autoGenerateTimerRef = useRef<number | null>(null);
   const previousAutoGenerateKeyRef = useRef<string | null>(null);
+  const autoInstallModelKeyRef = useRef<string | null>(null);
 
   const completeCount = useMemo(
     () => queue.filter((item) => item.status === "done").length,
@@ -360,6 +385,7 @@ function App() {
     [queue]
   );
   const vramDisplay = useMemo(() => formatVram(vram), [vram]);
+  const gpuOptions = useMemo(() => gpuDeviceOptions(vram), [vram]);
   const selectedModelStatus = modelStatuses[options.modelRepo];
   const activeDownload = downloadProgress;
   const activeModelLoad = preloadingModel && !activeDownload ? preloadingModel : null;
@@ -613,6 +639,35 @@ function App() {
     if (!isTauriRuntime()) return;
     void refreshModelStatus()
       .then((statuses) => {
+        const selectedStatus = statuses.find((status) => status.repo === options.modelRepo);
+        if (
+          options.generateDepth &&
+          selectedStatus &&
+          !selectedStatus.installed &&
+          !busy &&
+          !downloadingModel &&
+          autoInstallModelKeyRef.current !== options.modelRepo
+        ) {
+          autoInstallModelKeyRef.current = options.modelRepo;
+          window.localStorage.setItem(MODEL_PROMPT_SEEN_KEY, "1");
+          pushLog(`Installing ${modelName(options.modelRepo)} for local generation.`);
+          setDownloadingModel(options.modelRepo);
+          setDownloadProgress({
+            modelRepo: options.modelRepo,
+            message: `Preparing ${modelName(options.modelRepo)}`,
+            bytesDownloaded: 0,
+            bytesTotal: selectedStatus.sizeBytes,
+            percent: 0
+          });
+          setHeadline(`Preparing ${modelName(options.modelRepo)} download`);
+          void invoke("download_model", { modelRepo: options.modelRepo }).catch((error) => {
+            setDownloadingModel(null);
+            setDownloadProgress(null);
+            pushLog(`Model download failed to start: ${String(error)}`);
+          });
+          return;
+        }
+
         const promptSeen = window.localStorage.getItem(MODEL_PROMPT_SEEN_KEY) === "1";
         const anyInstalled = statuses.some((status) => status.installed);
         if (!promptSeen && !anyInstalled) {
@@ -620,7 +675,14 @@ function App() {
         }
       })
       .catch((error) => pushLog(`Could not read model status: ${String(error)}`));
-  }, [pushLog, refreshModelStatus]);
+  }, [
+    busy,
+    downloadingModel,
+    options.generateDepth,
+    options.modelRepo,
+    pushLog,
+    refreshModelStatus
+  ]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -1223,24 +1285,6 @@ function App() {
           </div>
 
           <label className="field">
-            <span>Device</span>
-            <select
-              value={options.device}
-              onChange={(event) =>
-                setOptions((current) => ({
-                  ...current,
-                  device: event.target.value as Device
-                }))
-              }
-            >
-              <option value="auto">Auto</option>
-              <option value="cuda">CUDA</option>
-              <option value="mps">Apple MPS</option>
-              <option value="cpu">CPU</option>
-            </select>
-          </label>
-
-          <label className="field">
             <span>Depth format</span>
             <select
               value={options.outputFormat}
@@ -1642,9 +1686,27 @@ function App() {
             <span>{errorCount}</span>
             failed
           </div>
-          <div>
-            <span className="vram-value">{vramDisplay.value}</span>
-            {vramDisplay.label}
+          <div className="gpu-stat">
+            <div className="gpu-stat-head">
+              <span className="vram-value">{vramDisplay.value}</span>
+              <select
+                value={options.device}
+                onChange={(event) =>
+                  setOptions((current) => ({
+                    ...current,
+                    device: event.target.value as Device
+                  }))
+                }
+                title="GPU for model loading and generation"
+              >
+                {gpuOptions.map((option) => (
+                  <option value={option.value} key={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <small>{vramDisplay.label}</small>
           </div>
         </div>
 

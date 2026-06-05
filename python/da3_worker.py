@@ -393,6 +393,18 @@ def relaunch_in_env(job_path: Path, env_dir: Path, need_depth: bool, daemon: boo
 def choose_device(requested: str):
     import torch
 
+    if requested.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("A CUDA GPU was requested, but torch.cuda is not available.")
+        try:
+            index = int(requested.split(":", 1)[1])
+        except ValueError as error:
+            raise RuntimeError(f"Invalid CUDA device: {requested}") from error
+        if index < 0 or index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"CUDA device {index} was requested, but {torch.cuda.device_count()} CUDA device(s) are available."
+            )
+        return torch.device(requested)
     if requested == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested, but torch.cuda is not available.")

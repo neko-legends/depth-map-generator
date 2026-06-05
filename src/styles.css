@@ -436,7 +436,7 @@ button:disabled {
   gap: 12px;
 }
 
-.stats div {
+.stats > div {
   border: 1px solid rgba(255, 138, 42, 0.15);
   border-radius: 8px;
   background: rgba(16, 12, 9, 0.72);
@@ -453,6 +453,32 @@ button:disabled {
 
 .stats .vram-value {
   font-size: 21px;
+}
+
+.gpu-stat {
+  min-width: 0;
+}
+
+.gpu-stat-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 0.9fr);
+  gap: 10px;
+  align-items: center;
+}
+
+.gpu-stat select {
+  min-height: 34px;
+  padding: 5px 8px;
+  color: #fff3e6;
+  font-size: 13px;
+}
+
+.gpu-stat small {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .download-status {
