@@ -134,7 +134,7 @@ small,
 
 .workspace-runtime {
   display: grid;
-  grid-template-columns: minmax(190px, 0.75fr) minmax(270px, 1fr) minmax(185px, 0.7fr) minmax(310px, 1.1fr);
+  grid-template-columns: minmax(170px, 0.7fr) minmax(260px, 1fr) minmax(170px, 0.65fr) minmax(330px, 1.15fr);
   gap: 14px;
   align-items: center;
   margin-top: 0;
@@ -166,11 +166,25 @@ small,
   min-width: 0;
 }
 
-.runtime-summary p,
+.runtime-model-note {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.runtime-model-note p,
+.runtime-model-note small,
 .runtime-heading p {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.runtime-model-note small {
+  color: #ffbf82;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.2;
 }
 
 .folder-button {

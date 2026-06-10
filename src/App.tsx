@@ -357,6 +357,16 @@ function previewOutputPath(paths?: string[]) {
   return paths?.find(isPreviewableImage);
 }
 
+function isWebpOutput(path: string) {
+  return /\.webp$/i.test(path);
+}
+
+function prioritizeDepthOutputs(paths: string[]) {
+  const depthOutputs = paths.filter((path) => !isWebpOutput(path));
+  const webpOutputs = paths.filter(isWebpOutput);
+  return [...depthOutputs, ...webpOutputs];
+}
+
 function compactPath(path: string) {
   if (!path) return "Same as source";
   const parts = path.split(/[\\/]/).filter(Boolean);
@@ -412,6 +422,7 @@ function App() {
   const vramDisplay = useMemo(() => formatVram(vram), [vram]);
   const gpuOptions = useMemo(() => gpuDeviceOptions(vram), [vram]);
   const selectedModelStatus = modelStatuses[options.modelRepo];
+  const selectedModelDetails = MODEL_DETAILS[options.modelRepo];
   const activeDownload = downloadProgress;
   const activeModelLoad = preloadingModel && !activeDownload ? preloadingModel : null;
   const currentModelReady = loadedModelKey?.startsWith(`${options.modelRepo}:`);
@@ -956,7 +967,7 @@ function App() {
       }
 
       if (payload.type === "image_done" && payload.path) {
-        const outputPaths = parseOutputPaths(payload.output);
+        const outputPaths = prioritizeDepthOutputs(parseOutputPaths(payload.output));
         if (outputPaths.length > 0) {
           setOutputPreviews((current) => {
             const next = { ...current };
@@ -1882,9 +1893,11 @@ function App() {
                 }))
               }
             >
-              <option value="sy000/MDA/mda_mog_sky_l2">MDA-DA3-MoG-Sky</option>
-              <option value="depth-anything/DA3-LARGE-1.1">DA3-LARGE-1.1</option>
-              <option value="depth-anything/DA3-SMALL">DA3-SMALL</option>
+              {MODEL_REPO_OPTIONS.map((repo) => (
+                <option value={repo} key={repo}>
+                  {MODEL_DETAILS[repo].name} ({MODEL_DETAILS[repo].vram.replace("Recommended: ", "")})
+                </option>
+              ))}
             </select>
           </label>
           <label className="toggle keep-loaded-toggle">
@@ -1899,17 +1912,20 @@ function App() {
             <span>Keep model loaded</span>
           </label>
           <div className="runtime-summary">
-            <p className="muted">
-              {!options.generateDepth
-                ? "Model downloads only when depth generation is enabled."
-                : currentModelReady
-                  ? `${modelName(options.modelRepo)} is loaded in memory.`
-                  : preloadingModel === options.modelRepo
-                    ? `${modelName(options.modelRepo)} is loading into memory.`
-                    : selectedModelStatus?.installed
-                  ? `${modelName(options.modelRepo)} is installed.`
-                  : `${modelName(options.modelRepo)} downloads when needed.`}
-            </p>
+            <div className="runtime-model-note">
+              <p className="muted">
+                {!options.generateDepth
+                  ? "Model downloads only when depth generation is enabled."
+                  : currentModelReady
+                    ? `${modelName(options.modelRepo)} is loaded in memory.`
+                    : preloadingModel === options.modelRepo
+                      ? `${modelName(options.modelRepo)} is loading into memory.`
+                      : selectedModelStatus?.installed
+                    ? `${modelName(options.modelRepo)} is installed.`
+                    : `${modelName(options.modelRepo)} downloads when needed.`}
+              </p>
+              <small>{selectedModelDetails.vram}</small>
+            </div>
             <div className="runtime-actions">
               <button className="secondary folder-button" onClick={openModelFolder}>
                 <FolderOpen size={16} />

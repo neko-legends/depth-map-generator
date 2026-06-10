@@ -18,7 +18,7 @@ use these depth maps as an input source.
 - Cancel active model downloads or batch jobs.
 - Optional resize-before-depth mode with aspect ratio preserved.
 - Depth outputs: 8-bit PNG, 16-bit PNG, or raw `.npy`.
-- Optional source-image WebP conversion.
+- Optional source-image WebP conversion, off by default.
 - PNG alpha is preserved with lossless WebP.
 - JPG-style inputs use configurable WebP quality.
 - Existing outputs get numbered filenames such as `_depth_2.png` when overwrite
@@ -26,9 +26,9 @@ use these depth maps as an input source.
 - The queue keeps output history per source image and shows recent output
   thumbnails first, so tuning changes can be compared without leaving the app.
 - Model selector:
-  - `sy000/MDA/mda_mog_sky_l2` by default.
-  - `depth-anything/DA3-LARGE-1.1` as a smaller fallback.
-  - `depth-anything/DA3-SMALL` for lower VRAM machines.
+  - `sy000/MDA/mda_mog_sky_l2` by default, recommended for 12 GB+ VRAM.
+  - `depth-anything/DA3-LARGE-1.1` as a smaller 8 GB+ VRAM fallback.
+  - `depth-anything/DA3-SMALL` for lower VRAM machines around 4 GB+ VRAM.
 - First-launch model picker with Later option.
 - Model download progress with percent and downloaded size.
 - Optional Keep model loaded mode, enabled by default, to keep the selected model warm between
