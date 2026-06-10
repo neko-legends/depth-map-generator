@@ -61,6 +61,16 @@ type ModelStatus = {
   sizeBytes: number;
 };
 
+type AgentServerStatus = {
+  enabled: boolean;
+  port: number;
+  url: string;
+  openapiUrl: string;
+  busy: boolean;
+  activeJobId: string | null;
+  message: string;
+};
+
 type DepthOptions = {
   device: Device;
   modelRepo: ModelRepo;
@@ -158,6 +168,9 @@ const defaultOptions: DepthOptions = {
 };
 
 const SETTINGS_STORAGE_KEY = "depthmapai.settings.v1";
+const AGENT_STORAGE_KEY = "depthmapai.agentControlEnabled.v1";
+const AGENT_PORT_STORAGE_KEY = "depthmapai.agentApiPort.v1";
+const DEFAULT_AGENT_API_PORT = 17334;
 const MDA_DEFAULT_MIGRATION_KEY = "depthmapai.mdaDefaultMigration.v1";
 const KEEP_LOADED_DEFAULT_MIGRATION_KEY = "depthmapai.keepLoadedDefaultMigration.v1";
 const MODEL_PROMPT_SEEN_KEY = "depthmapai.modelPromptSeen.v1";
@@ -200,6 +213,11 @@ const LOADING_NOISE = ["!@!#$%%^^&()", "#$%%^^&()!@!", "%%^^&()!@!#$", "^^&()!@!
 
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 const isTauriRuntime = () => "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
+
+function normalizeAgentPort(value: string) {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
 
 function coerceChoice<T extends string>(value: unknown, choices: T[], fallback: T) {
   return typeof value === "string" && choices.includes(value as T) ? (value as T) : fallback;
@@ -352,6 +370,13 @@ function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const queueRef = useRef<QueueItem[]>([]);
   const [options, setOptions] = useState<DepthOptions>(loadSavedOptions);
+  const [agentControlEnabled, setAgentControlEnabled] = useState(
+    () => window.localStorage.getItem(AGENT_STORAGE_KEY) === "1"
+  );
+  const [agentPort, setAgentPort] = useState(
+    () => window.localStorage.getItem(AGENT_PORT_STORAGE_KEY) ?? String(DEFAULT_AGENT_API_PORT)
+  );
+  const [agentStatus, setAgentStatus] = useState<AgentServerStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [canceling, setCanceling] = useState(false);
   const [headline, setHeadline] = useState("Drop images or folders");
@@ -567,6 +592,66 @@ function App() {
     return statuses;
   }, []);
 
+  const refreshAgentStatus = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    const status = await invoke<AgentServerStatus>("get_agent_server_status");
+    setAgentStatus(status);
+    if (status.enabled || !window.localStorage.getItem(AGENT_PORT_STORAGE_KEY)) {
+      setAgentPort(String(status.port || DEFAULT_AGENT_API_PORT));
+    }
+  }, []);
+
+  const toggleAgentControl = useCallback(
+    async (enabled: boolean) => {
+      const port = normalizeAgentPort(agentPort);
+      if (enabled && port === null) {
+        pushLog("Choose an Agent API port between 1 and 65535.");
+        return;
+      }
+      setAgentControlEnabled(enabled);
+      window.localStorage.setItem(AGENT_STORAGE_KEY, enabled ? "1" : "0");
+      if (port !== null) {
+        window.localStorage.setItem(AGENT_PORT_STORAGE_KEY, String(port));
+      }
+      if (!isTauriRuntime()) return;
+      try {
+        const status = await invoke<AgentServerStatus>("set_agent_server_enabled", {
+          enabled,
+          port: port ?? agentStatus?.port ?? DEFAULT_AGENT_API_PORT
+        });
+        setAgentStatus(status);
+        setAgentPort(String(status.port));
+        pushLog(status.message);
+      } catch (error) {
+        setAgentControlEnabled(false);
+        window.localStorage.setItem(AGENT_STORAGE_KEY, "0");
+        pushLog(String(error));
+      }
+    },
+    [agentPort, agentStatus?.port, pushLog]
+  );
+
+  const applyAgentPort = useCallback(async () => {
+    const port = normalizeAgentPort(agentPort);
+    if (port === null) {
+      pushLog("Choose an Agent API port between 1 and 65535.");
+      return;
+    }
+    window.localStorage.setItem(AGENT_PORT_STORAGE_KEY, String(port));
+    if (!isTauriRuntime() || !agentControlEnabled) return;
+    try {
+      const status = await invoke<AgentServerStatus>("set_agent_server_enabled", {
+        enabled: true,
+        port
+      });
+      setAgentStatus(status);
+      setAgentPort(String(status.port));
+      pushLog(`Agent API moved to ${status.url}`);
+    } catch (error) {
+      pushLog(String(error));
+    }
+  }, [agentControlEnabled, pushLog]);
+
   const markModelPromptSeen = useCallback(() => {
     window.localStorage.setItem(MODEL_PROMPT_SEEN_KEY, "1");
     setShowModelPrompt(false);
@@ -634,6 +719,26 @@ function App() {
     const interval = window.setInterval(refreshVram, 2500);
     return () => window.clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    void refreshAgentStatus().catch((error) => pushLog(`Agent API check failed: ${String(error)}`));
+  }, [pushLog, refreshAgentStatus]);
+
+  useEffect(() => {
+    if (!isTauriRuntime() || !agentControlEnabled) return;
+    const port = normalizeAgentPort(agentPort) ?? DEFAULT_AGENT_API_PORT;
+    void invoke<AgentServerStatus>("set_agent_server_enabled", { enabled: true, port })
+      .then((status) => {
+        setAgentStatus(status);
+        setAgentPort(String(status.port));
+      })
+      .catch((error) => {
+        setAgentControlEnabled(false);
+        window.localStorage.setItem(AGENT_STORAGE_KEY, "0");
+        pushLog(`Agent API failed to start: ${String(error)}`);
+      });
+  }, [agentControlEnabled, agentPort, pushLog]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -1565,6 +1670,37 @@ function App() {
             />
             <span>Auto generate on changes</span>
           </label>
+
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={agentControlEnabled}
+              onChange={(event) => void toggleAgentControl(event.target.checked)}
+            />
+            <span>Agent API</span>
+          </label>
+          <label className="field agent-port-field">
+            <span>API port</span>
+            <input
+              type="number"
+              min="1"
+              max="65535"
+              value={agentPort}
+              onChange={(event) => setAgentPort(event.target.value)}
+              onBlur={() => void applyAgentPort()}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.currentTarget.blur();
+                }
+              }}
+            />
+          </label>
+          {agentStatus?.enabled ? (
+            <div className="agent-status">
+              <span>{agentStatus.url}</span>
+              <small>OpenAPI: {agentStatus.openapiUrl}</small>
+            </div>
+          ) : null}
           </section>
 
           <section className="runtime">

@@ -2,11 +2,16 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{ChildStdin, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
@@ -23,6 +28,7 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const EMBEDDED_WORKER: &str = include_str!("../../python/da3_worker.py");
+const DEFAULT_AGENT_API_PORT: u16 = 17334;
 
 #[derive(Debug, Serialize)]
 struct RuntimeStatus {
@@ -95,6 +101,26 @@ struct WorkerJob {
     model_dir: String,
     download_only: bool,
     preload_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentJobRequest {
+    paths: Option<Vec<String>>,
+    model_repo: Option<String>,
+    options: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentServerStatus {
+    enabled: bool,
+    port: u16,
+    url: String,
+    openapi_url: String,
+    busy: bool,
+    active_job_id: Option<String>,
+    message: String,
 }
 
 #[derive(Clone, Default)]
@@ -185,6 +211,13 @@ impl ActiveJobState {
         *active = None;
         Ok(Some(canceled))
     }
+
+    fn active_job_id(&self) -> Result<Option<String>, String> {
+        self.inner
+            .lock()
+            .map(|job| job.as_ref().map(|job| job.id.clone()))
+            .map_err(|_| "Unable to lock active job state.".to_string())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -195,6 +228,52 @@ struct PersistentWorkerState {
 struct PersistentWorker {
     pid: u32,
     stdin: Arc<Mutex<ChildStdin>>,
+}
+
+#[derive(Clone, Default)]
+struct AgentServerState {
+    inner: Arc<Mutex<AgentServerControl>>,
+}
+
+#[derive(Default)]
+struct AgentServerControl {
+    enabled: bool,
+    port: u16,
+    stop: Option<Arc<AtomicBool>>,
+}
+
+impl AgentServerControl {
+    fn port(&self) -> u16 {
+        if self.port == 0 {
+            DEFAULT_AGENT_API_PORT
+        } else {
+            self.port
+        }
+    }
+}
+
+fn default_depth_options() -> DepthOptions {
+    DepthOptions {
+        device: "auto".to_string(),
+        model_repo: "sy000/MDA/mda_mog_sky_l2".to_string(),
+        output_format: "png8".to_string(),
+        generate_depth: true,
+        convert_webp: false,
+        webp_quality: 92,
+        invert: true,
+        recursive: true,
+        overwrite: false,
+        output_dir: String::new(),
+        suffix: "_depth".to_string(),
+        resize_mode: "none".to_string(),
+        resize_value: 1024,
+        process_res: 504,
+        process_res_method: "upper_bound_resize".to_string(),
+        normalize_low: 1.0,
+        normalize_high: 99.0,
+        depth_gamma: 1.0,
+        keep_model_loaded: false,
+    }
 }
 
 fn worker_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -538,25 +617,8 @@ fn persistent_worker(
     let job_id = Uuid::new_v4().to_string();
     let job_path = jobs_dir.join(format!("persistent-{job_id}.json"));
     let options = DepthOptions {
-        device: "auto".to_string(),
-        model_repo: "sy000/MDA/mda_mog_sky_l2".to_string(),
-        output_format: "png8".to_string(),
-        generate_depth: true,
-        convert_webp: false,
-        webp_quality: 92,
-        invert: true,
-        recursive: true,
-        overwrite: false,
-        output_dir: String::new(),
-        suffix: "_depth".to_string(),
-        resize_mode: "none".to_string(),
-        resize_value: 1024,
-        process_res: 504,
-        process_res_method: "upper_bound_resize".to_string(),
-        normalize_low: 1.0,
-        normalize_high: 99.0,
-        depth_gamma: 1.0,
         keep_model_loaded: true,
+        ..default_depth_options()
     };
     let job = WorkerJob {
         paths: Vec::new(),
@@ -686,8 +748,8 @@ fn persistent_worker(
 
 fn enqueue_persistent_job(
     app: AppHandle,
-    persistent_workers: State<'_, PersistentWorkerState>,
-    active_jobs: State<'_, ActiveJobState>,
+    persistent_workers: &PersistentWorkerState,
+    active_jobs: &ActiveJobState,
     paths: Vec<String>,
     options: DepthOptions,
     preload_only: bool,
@@ -711,7 +773,7 @@ fn enqueue_persistent_job(
     };
     let job_json = serde_json::to_string(&job)
         .map_err(|error| format!("Unable to serialize persistent job: {error}"))?;
-    let (pid, stdin) = persistent_worker(&app, &persistent_workers, &active_jobs)?;
+    let (pid, stdin) = persistent_worker(&app, persistent_workers, active_jobs)?;
     if let Err(error) = active_jobs.start(job_id.clone(), pid) {
         return Err(error);
     }
@@ -948,11 +1010,10 @@ fn get_vram_status() -> VramStatus {
     }
 }
 
-#[tauri::command]
-fn start_depth_job(
+fn start_depth_job_core(
     app: AppHandle,
-    persistent_workers: State<'_, PersistentWorkerState>,
-    active_jobs: State<'_, ActiveJobState>,
+    persistent_workers: &PersistentWorkerState,
+    active_jobs: &ActiveJobState,
     paths: Vec<String>,
     options: DepthOptions,
 ) -> Result<String, String> {
@@ -1012,7 +1073,7 @@ fn start_depth_job(
     let app_for_stdout = app.clone();
     let app_for_stderr = app.clone();
     let app_for_wait = app.clone();
-    let active_jobs_for_wait = active_jobs.inner().clone();
+    let active_jobs_for_wait = active_jobs.clone();
     let job_id_for_wait = job_id.clone();
 
     thread::spawn(move || {
@@ -1071,6 +1132,23 @@ fn start_depth_job(
 }
 
 #[tauri::command]
+fn start_depth_job(
+    app: AppHandle,
+    persistent_workers: State<'_, PersistentWorkerState>,
+    active_jobs: State<'_, ActiveJobState>,
+    paths: Vec<String>,
+    options: DepthOptions,
+) -> Result<String, String> {
+    start_depth_job_core(
+        app,
+        persistent_workers.inner(),
+        active_jobs.inner(),
+        paths,
+        options,
+    )
+}
+
+#[tauri::command]
 fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> {
     let active_jobs = app.state::<ActiveJobState>();
     if active_jobs.is_busy()? {
@@ -1088,25 +1166,8 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
     let job_id = Uuid::new_v4().to_string();
     let job_path = jobs_dir.join(format!("{job_id}.json"));
     let options = DepthOptions {
-        device: "auto".to_string(),
         model_repo,
-        output_format: "png8".to_string(),
-        generate_depth: true,
-        convert_webp: false,
-        webp_quality: 92,
-        invert: true,
-        recursive: true,
-        overwrite: false,
-        output_dir: String::new(),
-        suffix: "_depth".to_string(),
-        resize_mode: "none".to_string(),
-        resize_value: 1024,
-        process_res: 504,
-        process_res_method: "upper_bound_resize".to_string(),
-        normalize_low: 1.0,
-        normalize_high: 99.0,
-        depth_gamma: 1.0,
-        keep_model_loaded: false,
+        ..default_depth_options()
     };
     let job = WorkerJob {
         paths: Vec::new(),
@@ -1219,18 +1280,17 @@ fn preload_model(
     }
     enqueue_persistent_job(
         app,
-        persistent_workers,
-        active_jobs,
+        persistent_workers.inner(),
+        active_jobs.inner(),
         Vec::new(),
         options,
         true,
     )
 }
 
-#[tauri::command]
-fn stop_persistent_worker(
-    persistent_workers: State<'_, PersistentWorkerState>,
-    active_jobs: State<'_, ActiveJobState>,
+fn stop_persistent_worker_core(
+    persistent_workers: &PersistentWorkerState,
+    active_jobs: &ActiveJobState,
 ) -> Result<(), String> {
     if active_jobs.is_busy()? {
         return Ok(());
@@ -1249,15 +1309,452 @@ fn stop_persistent_worker(
     Ok(())
 }
 
+#[tauri::command]
+fn stop_persistent_worker(
+    persistent_workers: State<'_, PersistentWorkerState>,
+    active_jobs: State<'_, ActiveJobState>,
+) -> Result<(), String> {
+    stop_persistent_worker_core(persistent_workers.inner(), active_jobs.inner())
+}
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+fn validate_agent_api_port(port: Option<u16>) -> Result<u16, String> {
+    let port = port.unwrap_or(DEFAULT_AGENT_API_PORT);
+    if port == 0 {
+        return Err("Agent API port must be between 1 and 65535.".to_string());
+    }
+    Ok(port)
+}
+
+fn agent_api_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+fn agent_status_from(
+    agent_state: &AgentServerState,
+    active_jobs: &ActiveJobState,
+) -> Result<AgentServerStatus, String> {
+    let (enabled, port) = {
+        let control = agent_state
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock agent server state.".to_string())?;
+        (control.enabled, control.port())
+    };
+    let active_job_id = active_jobs.active_job_id()?;
+    Ok(AgentServerStatus {
+        enabled,
+        port,
+        url: agent_api_url(port),
+        openapi_url: format!("{}/openapi.json", agent_api_url(port)),
+        busy: active_job_id.is_some(),
+        active_job_id,
+        message: if enabled {
+            "Agent API is enabled.".to_string()
+        } else {
+            "Agent API is off.".to_string()
+        },
+    })
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("Unable to set read timeout: {error}"))?;
+    let mut data = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let mut expected_len: Option<usize> = None;
+
+    loop {
+        let bytes_read = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("Unable to read agent request: {error}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        data.extend_from_slice(&buffer[..bytes_read]);
+        if let Some(header_end) = find_header_end(&data) {
+            if expected_len.is_none() {
+                let headers = String::from_utf8_lossy(&data[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                expected_len = Some(header_end + 4 + content_length);
+            }
+            if expected_len.is_some_and(|len| data.len() >= len) {
+                break;
+            }
+        }
+        if data.len() > 2 * 1024 * 1024 {
+            return Err("Agent request is too large.".to_string());
+        }
+    }
+
+    let header_end = find_header_end(&data).ok_or_else(|| "Invalid HTTP request.".to_string())?;
+    let headers = String::from_utf8_lossy(&data[..header_end]);
+    let mut lines = headers.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "Invalid HTTP request line.".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let raw_path = parts.next().unwrap_or("/").to_string();
+    let path = raw_path.split('?').next().unwrap_or("/").to_string();
+    let body_start = header_end + 4;
+    let body = if body_start <= data.len() {
+        data[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(HttpRequest { method, path, body })
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn write_json_response(
+    stream: &mut TcpStream,
+    status: &str,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    let body = serde_json::to_vec(&payload)
+        .map_err(|error| format!("Unable to serialize agent response: {error}"))?;
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .and_then(|_| stream.write_all(&body))
+        .map_err(|error| format!("Unable to write agent response: {error}"))
+}
+
+fn write_empty_response(stream: &mut TcpStream, status: &str) -> Result<(), String> {
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .map_err(|error| format!("Unable to write agent response: {error}"))
+}
+
+fn agent_openapi(port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "DepthMap AI Generator Agent API",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "servers": [{ "url": agent_api_url(port) }],
+        "paths": {
+            "/health": { "get": { "summary": "Check API status" } },
+            "/status": { "get": { "summary": "Check active job status" } },
+            "/runtime": { "get": { "summary": "Check local runtime readiness" } },
+            "/vram": { "get": { "summary": "Check NVIDIA VRAM" } },
+            "/models": { "get": { "summary": "List supported model installation status" } },
+            "/download-model": { "post": { "summary": "Download the selected model" } },
+            "/prepare": { "post": { "summary": "Alias for model download" } },
+            "/preload": { "post": { "summary": "Load the selected model into the persistent worker" } },
+            "/generate": { "post": { "summary": "Start a depth generation job" } },
+            "/cancel": { "post": { "summary": "Cancel the active job" } },
+            "/stop-worker": { "post": { "summary": "Stop the persistent model worker" } }
+        }
+    })
+}
+
+fn parse_agent_job_request(body: &[u8]) -> Result<AgentJobRequest, String> {
+    if body.is_empty() {
+        return Ok(AgentJobRequest {
+            paths: None,
+            model_repo: None,
+            options: None,
+        });
+    }
+    serde_json::from_slice(body).map_err(|error| format!("Invalid JSON request: {error}"))
+}
+
+fn agent_options_from_request(options: Option<serde_json::Value>) -> Result<DepthOptions, String> {
+    let mut merged = serde_json::to_value(default_depth_options())
+        .map_err(|error| format!("Unable to build default options: {error}"))?;
+    let Some(options) = options else {
+        return serde_json::from_value(merged)
+            .map_err(|error| format!("Unable to read default options: {error}"));
+    };
+    if options.is_null() {
+        return serde_json::from_value(merged)
+            .map_err(|error| format!("Unable to read default options: {error}"));
+    }
+    let overrides = options
+        .as_object()
+        .ok_or_else(|| "Agent options must be a JSON object.".to_string())?;
+    let base = merged
+        .as_object_mut()
+        .ok_or_else(|| "Unable to merge default options.".to_string())?;
+    for (key, value) in overrides {
+        base.insert(key.clone(), value.clone());
+    }
+    serde_json::from_value(merged).map_err(|error| format!("Invalid agent options: {error}"))
+}
+
+fn agent_model_repo_from_request(request: AgentJobRequest) -> Result<String, String> {
+    let AgentJobRequest {
+        model_repo, options, ..
+    } = request;
+    if let Some(model_repo) = model_repo {
+        return Ok(model_repo);
+    }
+    agent_options_from_request(options).map(|options| options.model_repo)
+}
+
+fn agent_options_and_paths_from_request(
+    request: AgentJobRequest,
+) -> Result<(Option<Vec<String>>, DepthOptions), String> {
+    let AgentJobRequest {
+        paths,
+        model_repo,
+        options,
+    } = request;
+    let mut options = agent_options_from_request(options)?;
+    if let Some(model_repo) = model_repo {
+        options.model_repo = model_repo;
+    }
+    Ok((paths, options))
+}
+
+fn handle_agent_route(
+    request: HttpRequest,
+    app: &AppHandle,
+    persistent_workers: &PersistentWorkerState,
+    active_jobs: &ActiveJobState,
+    agent_state: &AgentServerState,
+) -> Result<serde_json::Value, String> {
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/health") => Ok(serde_json::json!({
+            "ok": true,
+            "service": "DepthMap AI Generator",
+            "version": env!("CARGO_PKG_VERSION"),
+            "url": agent_status_from(agent_state, active_jobs)?.url
+        })),
+        ("GET", "/openapi.json") => Ok(agent_openapi(agent_status_from(agent_state, active_jobs)?.port)),
+        ("GET", "/status") => {
+            let status = agent_status_from(agent_state, active_jobs)?;
+            serde_json::to_value(status).map_err(|error| error.to_string())
+        }
+        ("GET", "/runtime") => {
+            serde_json::to_value(check_runtime(app.clone())?).map_err(|error| error.to_string())
+        }
+        ("GET", "/vram") => {
+            serde_json::to_value(get_vram_status()).map_err(|error| error.to_string())
+        }
+        ("GET", "/models") => {
+            serde_json::to_value(get_model_status(app.clone())?).map_err(|error| error.to_string())
+        }
+        ("POST", "/download-model") | ("POST", "/prepare") => {
+            let request = parse_agent_job_request(&request.body)?;
+            let model_repo = agent_model_repo_from_request(request)?;
+            let job_id = download_model(app.clone(), model_repo)?;
+            Ok(serde_json::json!({ "ok": true, "jobId": job_id }))
+        }
+        ("POST", "/preload") => {
+            let request = parse_agent_job_request(&request.body)?;
+            let (_, mut options) = agent_options_and_paths_from_request(request)?;
+            options.generate_depth = true;
+            options.keep_model_loaded = true;
+            let job_id = enqueue_persistent_job(
+                app.clone(),
+                persistent_workers,
+                active_jobs,
+                Vec::new(),
+                options,
+                true,
+            )?;
+            Ok(serde_json::json!({ "ok": true, "jobId": job_id }))
+        }
+        ("POST", "/generate") => {
+            let request = parse_agent_job_request(&request.body)?;
+            let (paths, options) = agent_options_and_paths_from_request(request)?;
+            let paths = resolve_inputs(paths.unwrap_or_default(), options.recursive);
+            let job_id =
+                start_depth_job_core(app.clone(), persistent_workers, active_jobs, paths, options)?;
+            Ok(serde_json::json!({ "ok": true, "jobId": job_id }))
+        }
+        ("POST", "/cancel") => {
+            let pid = active_jobs.request_cancel()?;
+            kill_process_tree(pid)?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        ("POST", "/stop-worker") => {
+            stop_persistent_worker_core(persistent_workers, active_jobs)?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        _ => Err(format!(
+            "No agent endpoint for {} {}",
+            request.method, request.path
+        )),
+    }
+}
+
+fn handle_agent_stream(
+    mut stream: TcpStream,
+    app: &AppHandle,
+    persistent_workers: &PersistentWorkerState,
+    active_jobs: &ActiveJobState,
+    agent_state: &AgentServerState,
+) {
+    let result = read_http_request(&mut stream).and_then(|request| {
+        if request.method == "OPTIONS" {
+            return write_empty_response(&mut stream, "204 No Content");
+        }
+        match handle_agent_route(request, app, persistent_workers, active_jobs, agent_state) {
+            Ok(payload) => write_json_response(&mut stream, "200 OK", payload),
+            Err(error) => write_json_response(
+                &mut stream,
+                "400 Bad Request",
+                serde_json::json!({ "ok": false, "error": error }),
+            ),
+        }
+    });
+    if let Err(error) = result {
+        let _ = write_json_response(
+            &mut stream,
+            "400 Bad Request",
+            serde_json::json!({ "ok": false, "error": error }),
+        );
+    }
+}
+
+fn run_agent_server(
+    listener: TcpListener,
+    app: AppHandle,
+    persistent_workers: PersistentWorkerState,
+    active_jobs: ActiveJobState,
+    agent_state: AgentServerState,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = listener.set_nonblocking(true);
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => handle_agent_stream(
+                stream,
+                &app,
+                &persistent_workers,
+                &active_jobs,
+                &agent_state,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(80));
+            }
+            Err(_) => {
+                thread::sleep(Duration::from_millis(150));
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn get_agent_server_status(
+    agent_state: State<'_, AgentServerState>,
+    active_jobs: State<'_, ActiveJobState>,
+) -> Result<AgentServerStatus, String> {
+    agent_status_from(agent_state.inner(), active_jobs.inner())
+}
+
+fn set_agent_server_enabled_inner(
+    app: AppHandle,
+    agent_state: &AgentServerState,
+    persistent_workers: &PersistentWorkerState,
+    active_jobs: &ActiveJobState,
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<AgentServerStatus, String> {
+    let port = validate_agent_api_port(port)?;
+    {
+        let mut control = agent_state
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock agent server state.".to_string())?;
+
+        if control.enabled && (!enabled || control.port() != port) {
+            if let Some(stop) = control.stop.take() {
+                stop.store(true, Ordering::SeqCst);
+            }
+            control.enabled = false;
+        }
+        control.port = port;
+
+        if enabled && !control.enabled {
+            let listener = TcpListener::bind(("127.0.0.1", port))
+                .map_err(|error| format!("Unable to start Agent API: {error}"))?;
+            let stop = Arc::new(AtomicBool::new(false));
+            thread::spawn({
+                let app = app.clone();
+                let persistent_workers = persistent_workers.clone();
+                let active_jobs = active_jobs.clone();
+                let agent_state = agent_state.clone();
+                let stop = stop.clone();
+                move || {
+                    run_agent_server(
+                        listener,
+                        app,
+                        persistent_workers,
+                        active_jobs,
+                        agent_state,
+                        stop,
+                    )
+                }
+            });
+            control.enabled = true;
+            control.stop = Some(stop);
+        }
+    }
+
+    agent_status_from(agent_state, active_jobs)
+}
+
+#[tauri::command]
+fn set_agent_server_enabled(
+    app: AppHandle,
+    agent_state: State<'_, AgentServerState>,
+    persistent_workers: State<'_, PersistentWorkerState>,
+    active_jobs: State<'_, ActiveJobState>,
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<AgentServerStatus, String> {
+    set_agent_server_enabled_inner(
+        app,
+        agent_state.inner(),
+        persistent_workers.inner(),
+        active_jobs.inner(),
+        enabled,
+        port,
+    )
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(ActiveJobState::default())
         .manage(PersistentWorkerState::default())
+        .manage(AgentServerState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             cancel_active_job,
             check_runtime,
+            get_agent_server_status,
             get_model_status,
             get_vram_status,
             download_model,
@@ -1267,6 +1764,7 @@ pub fn run() {
             preload_model,
             preview_image_data_url,
             resolve_inputs,
+            set_agent_server_enabled,
             start_depth_job,
             stop_persistent_worker
         ])

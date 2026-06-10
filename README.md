@@ -39,6 +39,41 @@ model download, depth map export, and WebP conversion.
 - NVIDIA VRAM usage display when `nvidia-smi` is available.
 - Orange/black scalable 16:9 UI.
 
+## Agent API
+
+The local Agent API is off by default. Enable it from Settings with the
+`Agent API` toggle. The default port is `17334`, and the Settings panel lets you
+change it before or after enabling the API. When enabled, DepthMap AI Generator
+listens only on `127.0.0.1` and shows the active URL beside the toggle.
+
+Useful endpoints:
+
+- `GET /health`
+- `GET /openapi.json`
+- `GET /status`
+- `GET /runtime`
+- `GET /vram`
+- `GET /models`
+- `POST /download-model`
+- `POST /preload`
+- `POST /generate`
+- `POST /cancel`
+- `POST /stop-worker`
+
+Example generation request:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:17334/generate -ContentType 'application/json' -Body (@{
+  paths = @("D:\images\source.png")
+  options = @{
+    modelRepo = "sy000/MDA/mda_mog_sky_l2"
+    outputFormat = "png8"
+    generateDepth = $true
+    convertWebp = $false
+  }
+} | ConvertTo-Json -Depth 5)
+```
+
 ## Development
 
 Prerequisites:
