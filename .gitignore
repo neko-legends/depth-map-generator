@@ -1,6 +1,7 @@
 node_modules
 dist
 dist-portable
+release
 target
 src-tauri/target
 .DS_Store
