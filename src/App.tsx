@@ -349,6 +349,72 @@ function parseOutputPaths(output?: string) {
     .filter(Boolean) ?? [];
 }
 
+function cleanWorkerMessage(message: string) {
+  return message.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
+}
+
+function isNoisyWorkerMessage(message: string) {
+  const text = cleanWorkerMessage(message);
+  const lower = text.toLowerCase();
+  return (
+    /^(unexpected_keys|missing_keys)\b/i.test(text) ||
+    lower.includes("underreviewwarning") ||
+    lower.includes("futurewarning") ||
+    lower.includes("triton not found") ||
+    lower.includes("flop counting") ||
+    lower.includes("using swiglu layer") ||
+    lower.includes("self.nce_loss") ||
+    lower.includes("featuremapcontrastivetask") ||
+    lower.includes("generate_power_seq") ||
+    lower.includes("if not hasattr(numpy") ||
+    lower.includes("error registering eval resolver") ||
+    lower.includes("site-packages") ||
+    lower.includes("readthedocs.io")
+  );
+}
+
+function friendlySetupHeadline(message: string) {
+  const text = cleanWorkerMessage(message);
+  if (!text || isNoisyWorkerMessage(text)) return null;
+
+  const webpMatch = text.match(/^(.+):\s+(Already WebP|Lossless WebP saved|WebP saved.*)$/i);
+  if (webpMatch) return `Saved WebP for ${webpMatch[1]}`;
+
+  return /^(Creating|Recreating|Updating|Installing|Resolving|Downloading|Downloaded|Dependency|Preparing|Pinning|Skipped|Resized)\b/i.test(
+    text
+  ) || /already installed/i.test(text)
+    ? text
+    : null;
+}
+
+function friendlyWorkerHeadline(payload: WorkerEvent) {
+  const message = payload.message ? cleanWorkerMessage(payload.message) : "";
+  if (payload.type === "error") {
+    return message && !isNoisyWorkerMessage(message)
+      ? message
+      : "Something went wrong. See output details.";
+  }
+  if (payload.type === "canceled") return message || "Canceled.";
+  if (message && isNoisyWorkerMessage(message)) return null;
+
+  if (payload.type === "setup") {
+    return message ? friendlySetupHeadline(message) : null;
+  }
+  if (payload.type === "image_start") {
+    return payload.path ? `Processing ${fileName(payload.path)}` : message || "Processing image";
+  }
+  if (payload.type === "image_done") {
+    const outputCount = parseOutputPaths(payload.output).length;
+    const visibleCount = outputCount || 1;
+    const outputLabel = `${visibleCount} output${visibleCount === 1 ? "" : "s"}`;
+    return payload.path ? `Saved ${outputLabel} for ${fileName(payload.path)}` : `Saved ${outputLabel}`;
+  }
+  if (payload.type === "done") return message || "Batch finished.";
+  if (payload.type === "model" || payload.type === "model_ready") return message || null;
+
+  return null;
+}
+
 function isPreviewableImage(path: string) {
   return /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(path);
 }
@@ -929,8 +995,15 @@ function App() {
     const unlistenPromise = listen<WorkerEvent>("depth-worker-event", (event) => {
       const payload = event.payload;
       if (payload.message) {
-        setHeadline(payload.message);
-        pushLog(payload.message);
+        const logMessage = cleanWorkerMessage(payload.message);
+        if (logMessage) {
+          pushLog(logMessage);
+        }
+      }
+
+      const friendlyHeadline = friendlyWorkerHeadline(payload);
+      if (friendlyHeadline) {
+        setHeadline(friendlyHeadline);
       }
 
       if (payload.type === "model_ready" && payload.modelRepo) {
