@@ -4,10 +4,10 @@ DepthMap AI Generator is a local desktop batch tool for creating depth maps and
 WebP files from images and folders. It is designed for AI image workflows that
 need ControlNet-style depth maps without running ComfyUI.
 
-The app uses a Tauri 2 desktop shell with a React UI. Rust handles the desktop
-window, drag and drop, folder scanning, worker orchestration, and VRAM polling.
-Python handles MDA and Depth Anything inference, first-run dependency setup,
-model download, depth map export, and WebP conversion.
+This application was created as a base tool for adding depth to 2D images and
+for preparing source maps used by game effects, parallax views, and other 2.5D
+experiments. Tools such as ImageToASCII3D, and future 2.5D image effects, can
+use these depth maps as an input source.
 
 ## Features
 
@@ -128,17 +128,17 @@ npm run tauri:dev
 6. Build release artifacts.
 
 ```powershell
-npm run tauri:build
+npm run release:build
 ```
 
 Expected Windows outputs:
 
-- `src-tauri\target\release\depth-map-ai-generator.exe`
-- `src-tauri\target\release\bundle\nsis\DepthMap AI Generator_26.6.5_x64-setup.exe`
+- `release\portable\depth-map-ai-generator.exe`
+- `release\installer\DepthMap AI Generator_26.6.5_x64-setup.exe`
 
-The release executable is the portable build. It embeds the app UI and Python
-worker script; on first use it creates the app-managed Python environment and
-downloads runtime packages and model weights into the app data folder.
+`src-tauri\target\release` is Tauri's raw build output. `release\portable` and
+`release\installer` are the published artifact folders that should be used for
+sharing builds.
 
 Runtime notes for agents:
 
@@ -185,7 +185,7 @@ npm run tauri:dev
 Build the NSIS setup installer and portable release executable:
 
 ```powershell
-npm run tauri:build
+npm run release:build
 ```
 
 ## JavaScript Dependency Locking
@@ -225,7 +225,7 @@ When intentionally upgrading packages:
 2. Run `npm install` to refresh `package-lock.json`.
 3. Run `npm audit`.
 4. Run `npm run build`.
-5. Run `npm run tauri:build`.
+5. Run `npm run release:build`.
 6. Review and commit both `package.json` and `package-lock.json`.
 
 The current locked JavaScript tree has been checked with `npm audit` and reports
@@ -264,58 +264,7 @@ When intentionally upgrading Python runtime packages:
 5. Run a CUDA availability check in the app-managed environment when NVIDIA
    support matters.
 6. Run an MDA preload and one small MDA batch job.
-7. Run `npm run tauri:build`.
-
-## Runtime Behavior
-
-On first launch, the app offers to download MDA-DA3-MoG-Sky, DA3-LARGE-1.1, or
-DA3-SMALL. Choosing Later skips the download. If depth generation is later
-started with no selected model installed, the worker downloads that model before
-inference and shows download progress in the UI.
-
-By default, outputs are written beside each source image. The Settings panel can
-choose a single output folder instead. When overwrite is off and a target output
-already exists, the worker writes the next available numbered filename instead
-of replacing or skipping the file, for example `image_depth_2.png`.
-
-Each queued source image keeps an in-session output history. New outputs appear
-first as thumbnails in the Outputs column. Use the folder button on a row to open
-the folder containing the newest output.
-
-The Cancel button stops the active Python worker process tree. A canceled model
-download may leave an incomplete temporary download file, which is replaced on
-the next download attempt.
-
-The first WebP or depth run creates an app-managed Python virtual environment in
-the app data folder. It is separate from project `.venv` folders and avoids
-mixing with custom Python environments used by other projects. The launcher
-prefers Python 3.11, 3.12, or 3.10 and will not use Python 3.13+ for the managed
-environment.
-
-WebP-only runs install only Pillow. Depth-map runs install the ML runtime,
-install Depth Anything 3 from GitHub, and download the selected model when
-needed. MDA runs additionally download MDA's GitHub source and install the small
-extra runtime packages its wrappers import. On NVIDIA machines, the app forces
-the CUDA PyTorch wheel install so Auto can use the GPU instead of a CPU-only
-PyTorch wheel.
-
-Keep model loaded is enabled by default. When the selected model is already
-installed, the app starts a persistent Python worker after launch, loads it, and
-runs a tiny warm-up inference so the selected device is actually exercised. This
-reduces repeat-run latency because later depth jobs can reuse the loaded model
-instead of starting Python and loading it again. The model-loading indicator is
-intentionally not a percentage bar because PyTorch model load does not expose
-granular progress. Model downloads still show real percent progress.
-
-The Runtime panel can open `package-report.txt` in the app data folder. That
-report lists the direct install commands and, after setup has run, the exact
-packages currently installed in the app-managed Python environment.
-
-The app also installs `addict` because DA3 imports it in model/runtime modules
-but it is not currently listed in DA3's project dependency metadata.
-
-The repository does not include model weights, generated images, installers, or
-local Python environments.
+7. Run `npm run release:build`.
 
 ## Model And License Notes
 

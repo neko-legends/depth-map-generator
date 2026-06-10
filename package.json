@@ -10,7 +10,9 @@
     "preview": "vite preview --host 127.0.0.1 --port 1421",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "release:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\Publish-TauriReleases.ps1 -App DepthMapAIGenerator",
+    "release:build": "npm run tauri:build && npm run release:publish"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.0",

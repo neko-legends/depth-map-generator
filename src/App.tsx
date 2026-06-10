@@ -1703,66 +1703,6 @@ function App() {
           ) : null}
           </section>
 
-          <section className="runtime">
-          <div className="panel-title">
-            <Cpu size={16} />
-            Runtime
-          </div>
-          {runtime?.pythonFound ? (
-            <p className="ok">Python: {runtime.pythonCommand}</p>
-          ) : (
-            <p className="warn">Python 3.10, 3.11, or 3.12 not found on PATH.</p>
-          )}
-          <label className="field runtime-model">
-            <span>Depth model</span>
-            <select
-              value={options.modelRepo}
-              disabled={!options.generateDepth}
-              onChange={(event) =>
-                setOptions((current) => ({
-                  ...current,
-                  modelRepo: event.target.value as ModelRepo
-                }))
-              }
-            >
-              <option value="sy000/MDA/mda_mog_sky_l2">MDA-DA3-MoG-Sky</option>
-              <option value="depth-anything/DA3-LARGE-1.1">DA3-LARGE-1.1</option>
-              <option value="depth-anything/DA3-SMALL">DA3-SMALL</option>
-            </select>
-          </label>
-          <label className="toggle keep-loaded-toggle">
-            <input
-              type="checkbox"
-              checked={options.keepModelLoaded}
-              disabled={!options.generateDepth}
-              onChange={(event) =>
-                setOptions((current) => ({ ...current, keepModelLoaded: event.target.checked }))
-              }
-            />
-            <span>Keep model loaded</span>
-          </label>
-          <p className="muted">
-            {!options.generateDepth
-              ? "Model downloads only when depth generation is enabled."
-              : currentModelReady
-                ? `${modelName(options.modelRepo)} is loaded in memory.`
-                : preloadingModel === options.modelRepo
-                  ? `${modelName(options.modelRepo)} is loading into memory.`
-                  : selectedModelStatus?.installed
-                ? `${modelName(options.modelRepo)} is installed.`
-                : `${modelName(options.modelRepo)} downloads when needed.`}
-          </p>
-          <div className="runtime-actions">
-            <button className="secondary folder-button" onClick={openModelFolder}>
-              <FolderOpen size={16} />
-              Models
-            </button>
-            <button className="secondary folder-button" onClick={openPackageReport}>
-              <Package size={16} />
-              Packages
-            </button>
-          </div>
-          </section>
           <div className="app-version">{APP_VERSION}</div>
         </aside>
 
@@ -1917,6 +1857,71 @@ function App() {
             {previewImages.error ? <small className="preview-error">{previewImages.error}</small> : null}
           </section>
         </div>
+
+        <section className="runtime workspace-runtime">
+          <div className="runtime-heading">
+            <div className="panel-title">
+              <Cpu size={16} />
+              Runtime
+            </div>
+            {runtime?.pythonFound ? (
+              <p className="ok">Python: {runtime.pythonCommand}</p>
+            ) : (
+              <p className="warn">Python 3.10, 3.11, or 3.12 not found on PATH.</p>
+            )}
+          </div>
+          <label className="field runtime-model">
+            <span>Depth model</span>
+            <select
+              value={options.modelRepo}
+              disabled={!options.generateDepth}
+              onChange={(event) =>
+                setOptions((current) => ({
+                  ...current,
+                  modelRepo: event.target.value as ModelRepo
+                }))
+              }
+            >
+              <option value="sy000/MDA/mda_mog_sky_l2">MDA-DA3-MoG-Sky</option>
+              <option value="depth-anything/DA3-LARGE-1.1">DA3-LARGE-1.1</option>
+              <option value="depth-anything/DA3-SMALL">DA3-SMALL</option>
+            </select>
+          </label>
+          <label className="toggle keep-loaded-toggle">
+            <input
+              type="checkbox"
+              checked={options.keepModelLoaded}
+              disabled={!options.generateDepth}
+              onChange={(event) =>
+                setOptions((current) => ({ ...current, keepModelLoaded: event.target.checked }))
+              }
+            />
+            <span>Keep model loaded</span>
+          </label>
+          <div className="runtime-summary">
+            <p className="muted">
+              {!options.generateDepth
+                ? "Model downloads only when depth generation is enabled."
+                : currentModelReady
+                  ? `${modelName(options.modelRepo)} is loaded in memory.`
+                  : preloadingModel === options.modelRepo
+                    ? `${modelName(options.modelRepo)} is loading into memory.`
+                    : selectedModelStatus?.installed
+                  ? `${modelName(options.modelRepo)} is installed.`
+                  : `${modelName(options.modelRepo)} downloads when needed.`}
+            </p>
+            <div className="runtime-actions">
+              <button className="secondary folder-button" onClick={openModelFolder}>
+                <FolderOpen size={16} />
+                Models
+              </button>
+              <button className="secondary folder-button" onClick={openPackageReport}>
+                <Package size={16} />
+                Packages
+              </button>
+            </div>
+          </div>
+        </section>
 
         <section className="queue">
           <div className="queue-header">
