@@ -23,6 +23,9 @@ use std::os::unix::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+mod neko_store;
+use neko_store::NekoStore;
+
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "jfif", "jpf", "jp2", "j2k", "webp", "bmp", "tif", "tiff",
 ];
@@ -380,6 +383,59 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// App identifier used for the shared NekoLegendsAI store.
+const NEKO_APP_SLUG: &str = "depthmap";
+
+/// Resolve the shared NekoLegendsAI store for this app.
+///
+/// The default store volume is hinted to the executable's drive so that on a
+/// portable install on `D:` the store lands at `D:\NekoLegendsAI` (next to the
+/// app, on the roomy drive) rather than on the C: app-data volume.
+fn neko_store(app: &AppHandle) -> Result<NekoStore, String> {
+    let app_data = app_data_dir(app)?;
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    Ok(NekoStore::resolve_with_volume_hint(
+        NEKO_APP_SLUG,
+        &app_data,
+        exe_dir.as_deref(),
+    ))
+}
+
+/// The Python venv directory, preserving any pre-existing app-local install so
+/// upgrades never orphan a working environment.
+///
+/// If a legacy `<app_data>/python-env` already exists, it keeps being used.
+/// Otherwise the shared store's per-app venv is used so wheels are deduped.
+fn resolve_env_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data = app_data_dir(app)?;
+    let legacy = app_data.join("python-env");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    Ok(neko_store(app)?.env_dir)
+}
+
+/// The models root, preserving any pre-existing app-local models folder.
+fn resolve_models_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data = app_data_dir(app)?;
+    let legacy = app_data.join("models");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    Ok(neko_store(app)?.models_dir)
+}
+
+/// Apply shared cache env vars (HF/pip/uv/torch) to a worker command so that
+/// model and wheel downloads are reused across the whole suite.
+fn apply_store_env(app: &AppHandle, command: &mut Command) {
+    if let Ok(store) = neko_store(app) {
+        store.apply_env(command);
+    }
+}
+
+
 fn parse_python_version(output: &str) -> Option<(u32, u32, u32)> {
     let version = output
         .split_whitespace()
@@ -595,8 +651,8 @@ fn supported_models() -> [&'static str; 3] {
     ]
 }
 
-fn model_dir_for(app_data: &Path, model_repo: &str) -> Result<PathBuf, String> {
-    Ok(app_data.join("models").join(model_cache_name(model_repo)?))
+fn model_dir_for(models_root: &Path, model_repo: &str) -> Result<PathBuf, String> {
+    Ok(models_root.join(model_cache_name(model_repo)?))
 }
 
 fn model_file_for(model_dir: &Path, model_repo: &str) -> Result<PathBuf, String> {
@@ -639,8 +695,9 @@ fn persistent_worker(
     let worker = worker_path(app)?;
     let app_data = app_data_dir(app)?;
     let jobs_dir = app_data.join("jobs");
-    let env_dir = app_data.join("python-env");
-    let model_dir = model_dir_for(&app_data, "sy000/MDA/mda_mog_sky_l2")?;
+    let env_dir = resolve_env_dir(app)?;
+    let models_root = resolve_models_root(app)?;
+    let model_dir = model_dir_for(&models_root, "sy000/MDA/mda_mog_sky_l2")?;
     fs::create_dir_all(&jobs_dir).map_err(|error| format!("Unable to create jobs dir: {error}"))?;
 
     let job_id = Uuid::new_v4().to_string();
@@ -667,6 +724,7 @@ fn persistent_worker(
 
     let mut command = command_from_python_spec(&python);
     configure_worker_command(&mut command);
+    apply_store_env(app, &mut command);
     command
         .arg(worker)
         .arg("--daemon")
@@ -788,8 +846,9 @@ fn enqueue_persistent_job(
     }
 
     let app_data = app_data_dir(&app)?;
-    let env_dir = app_data.join("python-env");
-    let model_dir = model_dir_for(&app_data, &options.model_repo)?;
+    let env_dir = resolve_env_dir(&app)?;
+    let models_root = resolve_models_root(&app)?;
+    let model_dir = model_dir_for(&models_root, &options.model_repo)?;
     let job_id = Uuid::new_v4().to_string();
     let job = WorkerJob {
         paths,
@@ -853,11 +912,11 @@ fn check_runtime(app: AppHandle) -> Result<RuntimeStatus, String> {
 
 #[tauri::command]
 fn get_model_status(app: AppHandle) -> Result<Vec<ModelStatus>, String> {
-    let app_data = app_data_dir(&app)?;
+    let models_root = resolve_models_root(&app)?;
     supported_models()
         .into_iter()
         .map(|repo| {
-            let model_dir = model_dir_for(&app_data, repo)?;
+            let model_dir = model_dir_for(&models_root, repo)?;
             let model_path = model_file_for(&model_dir, repo)?;
             Ok(ModelStatus {
                 repo: repo.to_string(),
@@ -883,7 +942,7 @@ fn open_model_folder(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn open_package_report(app: AppHandle) -> Result<(), String> {
     let app_data = app_data_dir(&app)?;
-    let env_dir = app_data.join("python-env");
+    let env_dir = resolve_env_dir(&app)?;
     let report_path = app_data.join("package-report.txt");
     let report = format!(
         "\
@@ -1061,8 +1120,9 @@ fn start_depth_job_core(
     let worker = worker_path(&app)?;
     let app_data = app_data_dir(&app)?;
     let jobs_dir = app_data.join("jobs");
-    let env_dir = app_data.join("python-env");
-    let model_dir = model_dir_for(&app_data, &options.model_repo)?;
+    let env_dir = resolve_env_dir(&app)?;
+    let models_root = resolve_models_root(&app)?;
+    let model_dir = model_dir_for(&models_root, &options.model_repo)?;
     fs::create_dir_all(&jobs_dir).map_err(|error| format!("Unable to create jobs dir: {error}"))?;
 
     let job_id = Uuid::new_v4().to_string();
@@ -1082,6 +1142,7 @@ fn start_depth_job_core(
 
     let mut command = command_from_python_spec(&python);
     configure_worker_command(&mut command);
+    apply_store_env(&app, &mut command);
     command
         .arg(worker)
         .arg("--job")
@@ -1188,8 +1249,9 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
     let worker = worker_path(&app)?;
     let app_data = app_data_dir(&app)?;
     let jobs_dir = app_data.join("jobs");
-    let env_dir = app_data.join("python-env");
-    let model_dir = model_dir_for(&app_data, &model_repo)?;
+    let env_dir = resolve_env_dir(&app)?;
+    let models_root = resolve_models_root(&app)?;
+    let model_dir = model_dir_for(&models_root, &model_repo)?;
     fs::create_dir_all(&jobs_dir).map_err(|error| format!("Unable to create jobs dir: {error}"))?;
 
     let job_id = Uuid::new_v4().to_string();
@@ -1213,6 +1275,7 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
 
     let mut command = command_from_python_spec(&python);
     configure_worker_command(&mut command);
+    apply_store_env(&app, &mut command);
     command
         .arg(worker)
         .arg("--job")
