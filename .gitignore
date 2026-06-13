@@ -17,5 +17,10 @@ jobs
 *.npy
 *_depth.png
 *_depth.webp
+*.exe
 *.msi
+*.dmg
+*.zip
+*.7z
+*.tar.gz
 *-setup.exe
