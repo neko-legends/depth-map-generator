@@ -1,4 +1,4 @@
-# AGENTS.md — DepthMapAIGenerator
+# AGENTS.md — depth-map-generator
 
 Guidance for AI coding agents (and humans) working in this repo.
 

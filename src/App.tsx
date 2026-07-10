@@ -174,7 +174,7 @@ const DEFAULT_AGENT_API_PORT = 17334;
 const MDA_DEFAULT_MIGRATION_KEY = "depthmapai.mdaDefaultMigration.v1";
 const KEEP_LOADED_DEFAULT_MIGRATION_KEY = "depthmapai.keepLoadedDefaultMigration.v1";
 const MODEL_PROMPT_SEEN_KEY = "depthmapai.modelPromptSeen.v1";
-const APP_VERSION = "v26.6.5";
+const APP_VERSION = "v26.7.10";
 const DEVICE_OPTIONS: Device[] = ["auto", "cuda", "mps", "cpu"];
 const OUTPUT_FORMAT_OPTIONS: OutputFormat[] = ["png8", "png16", "npy"];
 const MODEL_REPO_OPTIONS: ModelRepo[] = [
@@ -447,7 +447,7 @@ function App() {
   const queueRef = useRef<QueueItem[]>([]);
   const [options, setOptions] = useState<DepthOptions>(loadSavedOptions);
   const [agentControlEnabled, setAgentControlEnabled] = useState(
-    () => window.localStorage.getItem(AGENT_STORAGE_KEY) === "1"
+    () => window.localStorage.getItem(AGENT_STORAGE_KEY) !== "0"
   );
   const [agentPort, setAgentPort] = useState(
     () => window.localStorage.getItem(AGENT_PORT_STORAGE_KEY) ?? String(DEFAULT_AGENT_API_PORT)

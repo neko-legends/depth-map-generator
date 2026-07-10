@@ -1,6 +1,6 @@
 [package]
 name = "depth-map-ai-generator"
-version = "26.6.5"
+version = "26.7.10"
 description = "Local depth map generator"
 authors = ["DepthMap AI Generator contributors"]
 license = "MIT"

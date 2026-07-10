@@ -1,7 +1,7 @@
 {
   "name": "depth-map-ai-generator",
   "private": true,
-  "version": "26.6.5",
+  "version": "26.7.10",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -11,7 +11,7 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "release:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\Publish-TauriReleases.ps1 -App DepthMapAIGenerator",
+    "release:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\Publish-TauriReleases.ps1 -App depth-map-generator",
     "release:build": "npm run tauri:build && npm run release:publish"
   },
   "dependencies": {

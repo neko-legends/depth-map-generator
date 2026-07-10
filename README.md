@@ -41,8 +41,9 @@ use these depth maps as an input source.
 
 ## Agent API
 
-The local Agent API is off by default. Enable it from Settings with the
-`Agent API` toggle. The default port is `17334`, and the Settings panel lets you
+The local Agent API is on by default so AI agents and the Neko Legends Control
+Center can use the app immediately. Disable it from Settings with the `Agent API`
+toggle if desired. The default port is `17334`, and the Settings panel lets you
 change it before or after enabling the API. When enabled, DepthMap AI Generator
 listens only on `127.0.0.1` and shows the active URL beside the toggle.
 
@@ -91,8 +92,8 @@ agent.
 1. Clone the repository.
 
 ```powershell
-git clone https://github.com/flashosophy/DepthMapAIGenerator.git
-cd DepthMapAIGenerator
+git clone https://github.com/neko-legends/depth-map-generator.git
+cd depth-map-generator
 ```
 
 2. Confirm required tools are available.
@@ -134,7 +135,7 @@ npm run release:build
 Expected Windows outputs:
 
 - `release\portable\depth-map-ai-generator.exe`
-- `release\installer\DepthMap AI Generator_26.6.5_x64-setup.exe`
+- `release\installer\DepthMap AI Generator_26.7.10_x64-setup.exe`
 
 `src-tauri\target\release` is Tauri's raw build output. `release\portable` and
 `release\installer` are the published artifact folders that should be used for

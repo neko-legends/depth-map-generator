@@ -1,8 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -37,6 +36,12 @@ const AGENT_APP_ID: &str = "depth-map-ai-generator";
 const AGENT_APP_NAME: &str = "DepthMap AI Generator";
 const AGENT_API_BIND_ADDRESS: &str = "127.0.0.1";
 const AGENT_API_REGISTRY_FILE: &str = "agent-api-registry.json";
+const DEFAULT_WINDOW_WIDTH: u32 = 1920;
+const DEFAULT_WINDOW_HEIGHT: u32 = 1080;
+const MIN_WINDOW_WIDTH: u32 = 640;
+const MIN_WINDOW_HEIGHT: u32 = 360;
+const LANDSCAPE_WINDOW_WIDTH_RATIO: f64 = 0.5;
+const PORTRAIT_WINDOW_WIDTH_RATIO: f64 = 0.9;
 
 #[derive(Debug, Serialize)]
 struct RuntimeStatus {
@@ -434,7 +439,6 @@ fn apply_store_env(app: &AppHandle, command: &mut Command) {
         store.apply_env(command);
     }
 }
-
 
 fn parse_python_version(output: &str) -> Option<(u32, u32, u32)> {
     let version = output
@@ -1700,7 +1704,9 @@ fn agent_options_from_request(options: Option<serde_json::Value>) -> Result<Dept
 
 fn agent_model_repo_from_request(request: AgentJobRequest) -> Result<String, String> {
     let AgentJobRequest {
-        model_repo, options, ..
+        model_repo,
+        options,
+        ..
     } = request;
     if let Some(model_repo) = model_repo {
         return Ok(model_repo);
@@ -1737,7 +1743,9 @@ fn handle_agent_route(
             "version": env!("CARGO_PKG_VERSION"),
             "url": agent_status_from(agent_state, active_jobs)?.url
         })),
-        ("GET", "/openapi.json") => Ok(agent_openapi(agent_status_from(agent_state, active_jobs)?.port)),
+        ("GET", "/openapi.json") => Ok(agent_openapi(
+            agent_status_from(agent_state, active_jobs)?.port,
+        )),
         ("GET", "/status") => {
             let status = agent_status_from(agent_state, active_jobs)?;
             serde_json::to_value(status).map_err(|error| error.to_string())
@@ -1932,6 +1940,103 @@ fn set_agent_server_enabled(
     )
 }
 
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn agent_api_headless_requested() -> bool {
+    env::args().any(|arg| arg == "--headless" || arg == "--serve-agent-api")
+        || env_truthy("NEKO_AGENT_HEADLESS")
+        || env_truthy("DEPTHMAP_AGENT_HEADLESS")
+}
+
+fn agent_api_cli_port() -> Option<u16> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--agent-api-port" || arg == "--agent-port" {
+            return args.next().and_then(|value| value.parse::<u16>().ok());
+        }
+        if let Some(value) = arg
+            .strip_prefix("--agent-api-port=")
+            .or_else(|| arg.strip_prefix("--agent-port="))
+        {
+            return value.parse::<u16>().ok();
+        }
+    }
+    env::var("DEPTHMAP_AGENT_API_PORT")
+        .or_else(|_| env::var("NEKO_AGENT_API_PORT"))
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+}
+
+fn hide_main_window(app: &tauri::App) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
+
+fn clamp_window_dimension(value: u32, min: u32, monitor_max: u32) -> u32 {
+    let max = monitor_max.max(1);
+    value.max(min.min(max)).min(max)
+}
+
+fn initial_window_size(monitor_width: u32, monitor_height: u32) -> tauri::PhysicalSize<u32> {
+    let width_ratio = if monitor_width < monitor_height {
+        PORTRAIT_WINDOW_WIDTH_RATIO
+    } else {
+        LANDSCAPE_WINDOW_WIDTH_RATIO
+    };
+    let aspect = DEFAULT_WINDOW_HEIGHT as f64 / DEFAULT_WINDOW_WIDTH as f64;
+    let mut width = (monitor_width as f64 * width_ratio).round();
+    let mut height = (width * aspect).round();
+    let max_height = (monitor_height as f64 * 0.9).round().max(1.0);
+
+    if height > max_height {
+        height = max_height;
+        width = (height / aspect).round();
+    }
+
+    tauri::PhysicalSize::new(width.max(1.0) as u32, height.max(1.0) as u32)
+}
+
+fn apply_initial_window_size(app: &tauri::App) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let monitor_size = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .map(|monitor| *monitor.size());
+    let monitor_width = monitor_size
+        .as_ref()
+        .map(|size| size.width)
+        .unwrap_or(DEFAULT_WINDOW_WIDTH);
+    let monitor_height = monitor_size
+        .as_ref()
+        .map(|size| size.height)
+        .unwrap_or(DEFAULT_WINDOW_HEIGHT);
+    let size = initial_window_size(monitor_width, monitor_height);
+    let size = tauri::PhysicalSize::new(
+        clamp_window_dimension(size.width, MIN_WINDOW_WIDTH, monitor_width),
+        clamp_window_dimension(size.height, MIN_WINDOW_HEIGHT, monitor_height),
+    );
+
+    if let Err(error) = window.set_size(tauri::Size::Physical(size)) {
+        eprintln!("Failed to initialize window size: {error}");
+    }
+    let _ = window.center();
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(ActiveJobState::default())
@@ -1939,6 +2044,30 @@ pub fn run() {
         .manage(AgentServerState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let headless = agent_api_headless_requested();
+            if !headless {
+                apply_initial_window_size(app);
+            }
+            if headless {
+                hide_main_window(app);
+                let handle = app.handle().clone();
+                let agent_state = app.state::<AgentServerState>().inner().clone();
+                let persistent_workers = app.state::<PersistentWorkerState>().inner().clone();
+                let active_jobs = app.state::<ActiveJobState>().inner().clone();
+                if let Err(error) = set_agent_server_enabled_inner(
+                    handle,
+                    &agent_state,
+                    &persistent_workers,
+                    &active_jobs,
+                    true,
+                    agent_api_cli_port(),
+                ) {
+                    eprintln!("Unable to start Agent API: {error}");
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             cancel_active_job,
             check_runtime,
