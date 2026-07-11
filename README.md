@@ -9,6 +9,19 @@ for preparing source maps used by game effects, parallax views, and other 2.5D
 experiments. Tools such as ImageToASCII3D, and future 2.5D image effects, can
 use these depth maps as an input source.
 
+[![DepthMap AI Generator showing a completed depth-map batch](assets/depth-map-ai-generator.png)](assets/depth-map-ai-generator.png)
+
+_Click the screenshot to view it at full size._
+
+## Example assets
+
+The repository includes the source image and generated depth-map examples used
+in the screenshot. Click any image to view the original asset.
+
+| Source image | Depth Anything output | MDA output |
+| --- | --- | --- |
+| [![Meat Festival source image](assets/meatFestival.jpg)](assets/meatFestival.jpg) | [![Depth Anything depth map](assets/meatFestival_depth.png)](assets/meatFestival_depth.png) | [![MDA depth map](assets/meatFestival_depth_MDA.png)](assets/meatFestival_depth_MDA.png) |
+
 ## Features
 
 - Drag in one image, many images, or folders.
