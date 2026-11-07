@@ -543,7 +543,9 @@ fn find_uv() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/uv"));
     candidates.push(PathBuf::from("/usr/bin/uv"));
     candidates.into_iter().find(|uv| {
-        Command::new(uv)
+        let mut command = Command::new(uv);
+        hide_command_window(&mut command);
+        command
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -557,7 +559,9 @@ fn find_uv() -> Option<PathBuf> {
 #[cfg(not(target_os = "windows"))]
 fn uv_python(uv: &Path, install: bool) -> Option<String> {
     let find = || -> Option<String> {
-        let output = Command::new(uv)
+        let mut command = Command::new(uv);
+        hide_command_window(&mut command);
+        let output = command
             .args(["python", "find", "--no-project", ">=3.10,<3.13"])
             .stderr(Stdio::null())
             .output()
@@ -575,7 +579,9 @@ fn uv_python(uv: &Path, install: bool) -> Option<String> {
     if !install {
         return None;
     }
-    let installed = Command::new(uv)
+    let mut command = Command::new(uv);
+    hide_command_window(&mut command);
+    let installed = command
         .args(["python", "install", UV_PYTHON_VERSION])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -604,6 +610,35 @@ fn hide_command_window(command: &mut Command) {
     #[cfg(target_os = "windows")]
     {
         command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(target_os = "linux")]
+    strip_appimage_env(command);
+}
+
+/// An AppImage's AppRun points PYTHONHOME, PYTHONPATH, LD_LIBRARY_PATH, PATH
+/// and friends into the mounted image, which breaks the system/uv Python and
+/// other external tools. Give child processes the environment without those
+/// AppImage entries.
+#[cfg(target_os = "linux")]
+fn strip_appimage_env(command: &mut Command) {
+    let Some(appdir) = env::var("APPDIR").ok().filter(|dir| !dir.is_empty()) else {
+        return;
+    };
+    let appdir = appdir.trim_end_matches('/').to_string();
+    for (key, value) in env::vars() {
+        if key == "APPDIR" || key == "APPIMAGE" || !value.contains(&appdir) {
+            continue;
+        }
+        let kept = value
+            .split(':')
+            .filter(|part| !part.is_empty() && !part.starts_with(&appdir))
+            .collect::<Vec<_>>()
+            .join(":");
+        if kept.is_empty() {
+            command.env_remove(&key);
+        } else {
+            command.env(&key, kept);
+        }
     }
 }
 
