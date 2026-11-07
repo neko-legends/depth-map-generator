@@ -69,6 +69,7 @@ type AgentServerStatus = {
   busy: boolean;
   activeJobId: string | null;
   message: string;
+  portPinned?: boolean;
 };
 
 type DepthOptions = {
@@ -121,6 +122,10 @@ type WorkerEvent = {
   bytesDownloaded?: number;
   bytesTotal?: number;
   percent?: number | null;
+  jobId?: string;
+  succeeded?: number;
+  failed?: number;
+  errors?: string[];
 };
 
 type DownloadProgress = {
@@ -174,7 +179,7 @@ const DEFAULT_AGENT_API_PORT = 17334;
 const MDA_DEFAULT_MIGRATION_KEY = "depthmapai.mdaDefaultMigration.v1";
 const KEEP_LOADED_DEFAULT_MIGRATION_KEY = "depthmapai.keepLoadedDefaultMigration.v2";
 const MODEL_PROMPT_SEEN_KEY = "depthmapai.modelPromptSeen.v1";
-const APP_VERSION = "v26.11.7";
+const APP_VERSION = "v26.11.9";
 const DEVICE_OPTIONS: Device[] = ["auto", "cuda", "mps", "cpu"];
 const OUTPUT_FORMAT_OPTIONS: OutputFormat[] = ["png8", "png16", "npy"];
 const MODEL_REPO_OPTIONS: ModelRepo[] = [
@@ -676,7 +681,10 @@ function App() {
     if (status.enabled || !agentControlEnabled) {
       const nextPort = String(status.port || DEFAULT_AGENT_API_PORT);
       setAgentPort(nextPort);
-      window.localStorage.setItem(AGENT_PORT_STORAGE_KEY, nextPort);
+      // A port pinned by --agent-api-port / env is temporary: don't save it.
+      if (!status.portPinned) {
+        window.localStorage.setItem(AGENT_PORT_STORAGE_KEY, nextPort);
+      }
     }
   }, [agentControlEnabled]);
 
@@ -1082,6 +1090,17 @@ function App() {
                   status: "error",
                   message: payload.message ?? "Failed"
                 }
+              : item
+          )
+        );
+      }
+
+      if (payload.type === "error") {
+        const failure = payload.message ? cleanWorkerMessage(payload.message) : "";
+        setQueue((current) =>
+          current.map((item) =>
+            item.status === "running"
+              ? { ...item, status: "error", message: failure || "Worker failed" }
               : item
           )
         );

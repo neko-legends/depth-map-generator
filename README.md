@@ -64,7 +64,9 @@ Useful endpoints:
 
 - `GET /health`
 - `GET /openapi.json`
-- `GET /status`
+- `GET /status` (includes `lastJob`, the most recent job's result)
+- `GET /jobs` and `GET /jobs/{jobId}`: job status (`running`, `completed`,
+  `completed_with_errors`, `failed`, `canceled`), outputs and error messages
 - `GET /runtime`
 - `GET /vram`
 - `GET /models`
@@ -73,6 +75,15 @@ Useful endpoints:
 - `POST /generate`
 - `POST /cancel`
 - `POST /stop-worker`
+
+`POST /generate` returns a `jobId`; poll `GET /jobs/{jobId}` until `status` is
+no longer `running`. Worker failures (bad input, GPU errors, a crashed worker)
+are reported there as `failed` with an `error` message.
+
+Headless mode: run the app with `--headless --agent-api-port <port>` (or set
+`DEPTHMAP_AGENT_API_PORT` / `NEKO_AGENT_API_PORT`). An explicit port always
+wins over the port saved in Settings and in the shared
+`agent-api-registry.json`.
 
 Example generation request:
 
@@ -148,7 +159,7 @@ npm run release:build
 Expected Windows outputs:
 
 - `release\portable\depth-map-ai-generator.exe`
-- `release\installer\DepthMap AI Generator_26.11.7_x64-setup.exe`
+- `release\installer\DepthMap AI Generator_26.11.9_x64-setup.exe`
 
 `src-tauri\target\release` is Tauri's raw build output. `release\portable` and
 `release\installer` are the published artifact folders that should be used for

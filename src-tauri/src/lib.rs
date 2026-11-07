@@ -5,7 +5,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -134,6 +134,8 @@ struct AgentServerStatus {
     busy: bool,
     active_job_id: Option<String>,
     message: String,
+    /// True when the port was fixed by `--agent-api-port` or an env var.
+    port_pinned: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -254,6 +256,241 @@ impl ActiveJobState {
             .lock()
             .map(|job| job.as_ref().map(|job| job.id.clone()))
             .map_err(|_| "Unable to lock active job state.".to_string())
+    }
+}
+
+const JOB_HISTORY_LIMIT: usize = 50;
+const JOB_LOG_TAIL_LIMIT: usize = 20;
+
+/// Outcome of one worker job, kept so the Agent API (and the GUI) can report
+/// failures instead of silently going idle when the Python worker fails.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobRecord {
+    job_id: String,
+    kind: String,
+    /// running | completed | completed_with_errors | failed | canceled
+    status: String,
+    message: Option<String>,
+    error: Option<String>,
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    outputs: Vec<String>,
+    errors: Vec<String>,
+    log_tail: Vec<String>,
+    started_at: String,
+    finished_at: Option<String>,
+}
+
+impl JobRecord {
+    fn is_running(&self) -> bool {
+        self.status == "running"
+    }
+
+    fn finish(&mut self, status: &str) {
+        self.status = status.to_string();
+        self.finished_at = Some(timestamp_string());
+    }
+}
+
+#[derive(Clone, Default)]
+struct JobHistoryState {
+    inner: Arc<Mutex<Vec<JobRecord>>>,
+}
+
+impl JobHistoryState {
+    fn with_job<T>(&self, job_id: &str, update: impl FnOnce(&mut JobRecord) -> T) -> Option<T> {
+        let mut jobs = self.inner.lock().ok()?;
+        jobs.iter_mut().find(|job| job.job_id == job_id).map(update)
+    }
+
+    fn begin(&self, job_id: &str, kind: &str, total: usize) {
+        let Ok(mut jobs) = self.inner.lock() else {
+            return;
+        };
+        jobs.retain(|job| job.job_id != job_id);
+        jobs.push(JobRecord {
+            job_id: job_id.to_string(),
+            kind: kind.to_string(),
+            status: "running".to_string(),
+            message: None,
+            error: None,
+            total,
+            succeeded: 0,
+            failed: 0,
+            outputs: Vec::new(),
+            errors: Vec::new(),
+            log_tail: Vec::new(),
+            started_at: timestamp_string(),
+            finished_at: None,
+        });
+        let overflow = jobs.len().saturating_sub(JOB_HISTORY_LIMIT);
+        if overflow > 0 {
+            jobs.drain(..overflow);
+        }
+    }
+
+    fn get(&self, job_id: &str) -> Option<JobRecord> {
+        self.with_job(job_id, |job| job.clone())
+    }
+
+    fn latest(&self) -> Option<JobRecord> {
+        self.inner.lock().ok()?.last().cloned()
+    }
+
+    fn list(&self) -> Vec<JobRecord> {
+        self.inner
+            .lock()
+            .map(|jobs| jobs.iter().rev().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_log(&self, job_id: &str, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        self.with_job(job_id, |job| {
+            job.log_tail.push(line.to_string());
+            let overflow = job.log_tail.len().saturating_sub(JOB_LOG_TAIL_LIMIT);
+            if overflow > 0 {
+                job.log_tail.drain(..overflow);
+            }
+        });
+    }
+
+    /// Applies one worker event. Returns true when the event ended the job.
+    fn record_event(&self, job_id: &str, value: &serde_json::Value) -> bool {
+        let event_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        self.with_job(job_id, |job| {
+            if !job.is_running() {
+                return false;
+            }
+            match event_type {
+                "image_done" => {
+                    job.succeeded += 1;
+                    if let Some(output) = value.get("output").and_then(serde_json::Value::as_str) {
+                        job.outputs.extend(
+                            output
+                                .split("; ")
+                                .filter(|path| !path.is_empty())
+                                .map(str::to_string),
+                        );
+                    }
+                    false
+                }
+                "image_error" => {
+                    job.failed += 1;
+                    let path = value
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|path| {
+                            Path::new(path)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.to_string())
+                        });
+                    let text = message.clone().unwrap_or_else(|| "Failed".to_string());
+                    job.errors.push(match path {
+                        Some(path) => format!("{path}: {text}"),
+                        None => text,
+                    });
+                    false
+                }
+                "done" => {
+                    job.message = message;
+                    if job.failed > 0 {
+                        job.error = job.errors.first().cloned();
+                        let status = if job.succeeded == 0 {
+                            "failed"
+                        } else {
+                            "completed_with_errors"
+                        };
+                        job.finish(status);
+                    } else {
+                        job.finish("completed");
+                    }
+                    true
+                }
+                "error" => {
+                    let text = message.unwrap_or_else(|| "Worker reported an error.".to_string());
+                    job.message = Some(text.clone());
+                    job.error = Some(text);
+                    job.finish("failed");
+                    true
+                }
+                "canceled" => {
+                    job.message = message.or_else(|| Some("Job canceled.".to_string()));
+                    job.finish("canceled");
+                    true
+                }
+                _ => {
+                    if let Some(text) = message {
+                        job.log_tail.push(text);
+                        let overflow = job.log_tail.len().saturating_sub(JOB_LOG_TAIL_LIMIT);
+                        if overflow > 0 {
+                            job.log_tail.drain(..overflow);
+                        }
+                    }
+                    false
+                }
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// Finalizes a job whose worker process exited (or crashed) without a
+    /// terminal event. Returns the event to show in the GUI, if one is needed.
+    fn finish_after_exit(
+        &self,
+        job_id: &str,
+        canceled: bool,
+        exit: Result<std::process::ExitStatus, String>,
+        label: &str,
+    ) -> Option<serde_json::Value> {
+        self.with_job(job_id, |job| {
+            if !job.is_running() {
+                return None;
+            }
+            if canceled {
+                job.message = Some("Job canceled.".to_string());
+                job.finish("canceled");
+                return Some(serde_json::json!({ "type": "canceled", "message": "Job canceled." }));
+            }
+            let reason = match &exit {
+                Ok(status) if status.success() => {
+                    format!("{label} exited without reporting a result.")
+                }
+                Ok(status) => match status.code() {
+                    Some(code) => format!("{label} exited with code {code}."),
+                    None => format!("{label} was terminated."),
+                },
+                Err(error) => format!("{label} could not be monitored: {error}"),
+            };
+            let detail = job
+                .log_tail
+                .iter()
+                .rev()
+                .find(|line| !line.starts_with("Traceback") && !line.starts_with("File "))
+                .cloned();
+            let text = match detail {
+                Some(detail) => format!("{reason} Last output: {detail}"),
+                None => reason,
+            };
+            job.message = Some(text.clone());
+            job.error = Some(text.clone());
+            job.finish("failed");
+            Some(serde_json::json!({ "type": "error", "message": text, "jobId": job_id }))
+        })
+        .flatten()
     }
 }
 
@@ -885,20 +1122,37 @@ fn persistent_worker(
     let app_for_stderr = app.clone();
     let app_for_wait = app.clone();
     let active_jobs_for_stdout = (*active_jobs).clone();
+    let active_jobs_for_stderr = (*active_jobs).clone();
     let active_jobs_for_wait = (*active_jobs).clone();
     let persistent_for_wait = (*persistent_workers).clone();
+    let history = app.state::<JobHistoryState>().inner().clone();
+    let history_for_stdout = history.clone();
+    let history_for_stderr = history.clone();
+    let history_for_wait = history;
 
-    thread::spawn(move || {
+    let stdout_thread = thread::spawn(move || {
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                let job_id = active_jobs_for_stdout.active_job_id().ok().flatten();
+                if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) {
                     let terminal = terminal_worker_event(&value);
+                    if let Some(job_id) = &job_id {
+                        history_for_stdout.record_event(job_id, &value);
+                        if let Some(object) = value.as_object_mut() {
+                            object
+                                .entry("jobId")
+                                .or_insert_with(|| serde_json::Value::String(job_id.clone()));
+                        }
+                    }
                     let _ = app_for_stdout.emit("depth-worker-event", value);
                     if terminal {
                         let _ = active_jobs_for_stdout.finish_current();
                     }
                 } else {
+                    if let Some(job_id) = &job_id {
+                        history_for_stdout.record_log(job_id, &line);
+                    }
                     let _ = app_for_stdout.emit(
                         "depth-worker-event",
                         serde_json::json!({ "type": "setup", "message": line }),
@@ -908,10 +1162,13 @@ fn persistent_worker(
         }
     });
 
-    thread::spawn(move || {
+    let stderr_thread = thread::spawn(move || {
         if let Some(stderr) = stderr {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
+                if let Some(job_id) = active_jobs_for_stderr.active_job_id().ok().flatten() {
+                    history_for_stderr.record_log(&job_id, &line);
+                }
                 let _ = app_for_stderr.emit(
                     "depth-worker-event",
                     serde_json::json!({ "type": "setup", "message": line }),
@@ -921,7 +1178,9 @@ fn persistent_worker(
     });
 
     thread::spawn(move || {
-        let status = child.wait();
+        let status = child.wait().map_err(|error| error.to_string());
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
         if let Ok(mut worker) = persistent_for_wait.inner.lock() {
             if worker
                 .as_ref()
@@ -930,27 +1189,36 @@ fn persistent_worker(
                 *worker = None;
             }
         }
+        let active_job_id = active_jobs_for_wait
+            .active_job_id()
+            .ok()
+            .flatten();
         let canceled = active_jobs_for_wait
             .finish_pid(child_pid)
             .ok()
-            .flatten()
-            .unwrap_or(false);
-        if canceled {
-            let _ = app_for_wait.emit(
-                "depth-worker-event",
-                serde_json::json!({
-                    "type": "canceled",
-                    "message": "Job canceled."
-                }),
-            );
-        } else if !matches!(status, Ok(status) if status.success()) {
-            let _ = app_for_wait.emit(
-                "depth-worker-event",
-                serde_json::json!({
-                    "type": "error",
-                    "message": "Persistent depth worker exited with an error."
-                }),
-            );
+            .flatten();
+        match (active_job_id, canceled) {
+            (Some(job_id), Some(canceled)) => {
+                if let Some(event) = history_for_wait.finish_after_exit(
+                    &job_id,
+                    canceled,
+                    status,
+                    "Persistent depth worker",
+                ) {
+                    let _ = app_for_wait.emit("depth-worker-event", event);
+                }
+            }
+            _ => {
+                if !matches!(status, Ok(status) if status.success()) {
+                    let _ = app_for_wait.emit(
+                        "depth-worker-event",
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "Persistent depth worker exited with an error."
+                        }),
+                    );
+                }
+            }
         }
     });
 
@@ -997,10 +1265,13 @@ fn enqueue_persistent_job(
     };
     let job_json = serde_json::to_string(&job)
         .map_err(|error| format!("Unable to serialize persistent job: {error}"))?;
+    let total = job.paths.len();
     let (pid, stdin) = persistent_worker(&app, persistent_workers, active_jobs)?;
     if let Err(error) = active_jobs.start(job_id.clone(), pid) {
         return Err(error);
     }
+    let history = app.state::<JobHistoryState>().inner().clone();
+    history.begin(&job_id, if preload_only { "preload" } else { "generate" }, total);
     let send_result = stdin
         .lock()
         .map_err(|_| "Unable to lock persistent worker input.".to_string())
@@ -1011,6 +1282,10 @@ fn enqueue_persistent_job(
         });
     if let Err(error) = send_result {
         let _ = active_jobs.finish(&job_id);
+        history.record_event(
+            &job_id,
+            &serde_json::json!({ "type": "error", "message": error.clone() }),
+        );
         return Err(error);
     }
     Ok(job_id)
@@ -1234,6 +1509,77 @@ fn get_vram_status() -> VramStatus {
     }
 }
 
+fn monitor_worker_job(
+    app: &AppHandle,
+    mut child: Child,
+    job_id: String,
+    active_jobs: ActiveJobState,
+    label: &'static str,
+) {
+    let history = app.state::<JobHistoryState>().inner().clone();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_thread = {
+        let app = app.clone();
+        let history = history.clone();
+        let job_id = job_id.clone();
+        thread::spawn(move || {
+            let Some(stdout) = stdout else {
+                return;
+            };
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    history.record_event(&job_id, &value);
+                    if let Some(object) = value.as_object_mut() {
+                        object
+                            .entry("jobId")
+                            .or_insert_with(|| serde_json::Value::String(job_id.clone()));
+                    }
+                    let _ = app.emit("depth-worker-event", value);
+                } else {
+                    history.record_log(&job_id, &line);
+                    let _ = app.emit(
+                        "depth-worker-event",
+                        serde_json::json!({ "type": "setup", "message": line }),
+                    );
+                }
+            }
+        })
+    };
+
+    let stderr_thread = {
+        let app = app.clone();
+        let history = history.clone();
+        let job_id = job_id.clone();
+        thread::spawn(move || {
+            let Some(stderr) = stderr else {
+                return;
+            };
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                history.record_log(&job_id, &line);
+                let _ = app.emit(
+                    "depth-worker-event",
+                    serde_json::json!({ "type": "setup", "message": line }),
+                );
+            }
+        })
+    };
+
+    let app = app.clone();
+    thread::spawn(move || {
+        let status = child.wait().map_err(|error| error.to_string());
+        // Drain the pipes first so a terminal event printed just before exit is
+        // recorded before deciding whether the worker failed silently.
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+        let canceled = active_jobs.finish(&job_id).unwrap_or(false);
+        if let Some(event) = history.finish_after_exit(&job_id, canceled, status, label) {
+            let _ = app.emit("depth-worker-event", event);
+        }
+    });
+}
+
 fn start_depth_job_core(
     app: AppHandle,
     persistent_workers: &PersistentWorkerState,
@@ -1285,7 +1631,7 @@ fn start_depth_job_core(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| format!("Unable to start Python worker: {error}"))?;
     let child_pid = child.id();
@@ -1293,65 +1639,9 @@ fn start_depth_job_core(
         let _ = kill_process_tree(child_pid);
         return Err(error);
     }
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let app_for_stdout = app.clone();
-    let app_for_stderr = app.clone();
-    let app_for_wait = app.clone();
-    let active_jobs_for_wait = active_jobs.clone();
-    let job_id_for_wait = job_id.clone();
-
-    thread::spawn(move || {
-        if let Some(stdout) = stdout {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                    let _ = app_for_stdout.emit("depth-worker-event", value);
-                } else {
-                    let _ = app_for_stdout.emit(
-                        "depth-worker-event",
-                        serde_json::json!({ "type": "setup", "message": line }),
-                    );
-                }
-            }
-        }
-    });
-
-    thread::spawn(move || {
-        if let Some(stderr) = stderr {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                let _ = app_for_stderr.emit(
-                    "depth-worker-event",
-                    serde_json::json!({ "type": "setup", "message": line }),
-                );
-            }
-        }
-    });
-
-    thread::spawn(move || {
-        let status = child.wait();
-        let was_canceled = active_jobs_for_wait
-            .finish(&job_id_for_wait)
-            .unwrap_or(false);
-        if was_canceled {
-            let _ = app_for_wait.emit(
-                "depth-worker-event",
-                serde_json::json!({
-                    "type": "canceled",
-                    "message": "Job canceled."
-                }),
-            );
-        } else if !matches!(status, Ok(status) if status.success()) {
-            let _ = app_for_wait.emit(
-                "depth-worker-event",
-                serde_json::json!({
-                    "type": "error",
-                    "message": "Depth worker exited with an error."
-                }),
-            );
-        }
-    });
+    app.state::<JobHistoryState>()
+        .begin(&job_id, "generate", job.paths.len());
+    monitor_worker_job(&app, child, job_id.clone(), active_jobs.clone(), "Depth worker");
 
     Ok(job_id)
 }
@@ -1417,7 +1707,7 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| format!("Unable to start Python worker: {error}"))?;
     let child_pid = child.id();
@@ -1425,65 +1715,14 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
         let _ = kill_process_tree(child_pid);
         return Err(error);
     }
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let app_for_stdout = app.clone();
-    let app_for_stderr = app.clone();
-    let app_for_wait = app.clone();
-    let active_jobs_for_wait = active_jobs.inner().clone();
-    let job_id_for_wait = job_id.clone();
-
-    thread::spawn(move || {
-        if let Some(stdout) = stdout {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                    let _ = app_for_stdout.emit("depth-worker-event", value);
-                } else {
-                    let _ = app_for_stdout.emit(
-                        "depth-worker-event",
-                        serde_json::json!({ "type": "setup", "message": line }),
-                    );
-                }
-            }
-        }
-    });
-
-    thread::spawn(move || {
-        if let Some(stderr) = stderr {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                let _ = app_for_stderr.emit(
-                    "depth-worker-event",
-                    serde_json::json!({ "type": "setup", "message": line }),
-                );
-            }
-        }
-    });
-
-    thread::spawn(move || {
-        let status = child.wait();
-        let was_canceled = active_jobs_for_wait
-            .finish(&job_id_for_wait)
-            .unwrap_or(false);
-        if was_canceled {
-            let _ = app_for_wait.emit(
-                "depth-worker-event",
-                serde_json::json!({
-                    "type": "canceled",
-                    "message": "Job canceled."
-                }),
-            );
-        } else if !matches!(status, Ok(status) if status.success()) {
-            let _ = app_for_wait.emit(
-                "depth-worker-event",
-                serde_json::json!({
-                    "type": "error",
-                    "message": "Model download worker exited with an error."
-                }),
-            );
-        }
-    });
+    app.state::<JobHistoryState>().begin(&job_id, "download", 0);
+    monitor_worker_job(
+        &app,
+        child,
+        job_id.clone(),
+        active_jobs.inner().clone(),
+        "Model download worker",
+    );
 
     Ok(job_id)
 }
@@ -1549,6 +1788,8 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+/// Resolves the port: an explicitly requested port first, then the port saved
+/// in the shared registry, then the default.
 fn validate_agent_api_port(port: Option<u16>) -> Result<u16, String> {
     let port = port
         .or_else(read_registered_agent_api_port)
@@ -1674,6 +1915,7 @@ fn agent_status_from(
         openapi_url: format!("{}/openapi.json", agent_api_url(port)),
         busy: active_job_id.is_some(),
         active_job_id,
+        port_pinned: agent_api_cli_port().is_some(),
         message: if enabled {
             "Agent API is enabled.".to_string()
         } else {
@@ -1784,7 +2026,9 @@ fn agent_openapi(port: u16) -> serde_json::Value {
         "servers": [{ "url": agent_api_url(port) }],
         "paths": {
             "/health": { "get": { "summary": "Check API status" } },
-            "/status": { "get": { "summary": "Check active job status" } },
+            "/status": { "get": { "summary": "Check active job status and the most recent job result (lastJob)" } },
+            "/jobs": { "get": { "summary": "List recent jobs with status (running, completed, completed_with_errors, failed, canceled) and errors" } },
+            "/jobs/{jobId}": { "get": { "summary": "Get one job's status, outputs, and error message" } },
             "/runtime": { "get": { "summary": "Check local runtime readiness" } },
             "/vram": { "get": { "summary": "Check NVIDIA VRAM" } },
             "/models": { "get": { "summary": "List supported model installation status" } },
@@ -1878,7 +2122,25 @@ fn handle_agent_route(
         )),
         ("GET", "/status") => {
             let status = agent_status_from(agent_state, active_jobs)?;
-            serde_json::to_value(status).map_err(|error| error.to_string())
+            let mut value = serde_json::to_value(status).map_err(|error| error.to_string())?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "lastJob".to_string(),
+                    serde_json::to_value(app.state::<JobHistoryState>().latest())
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            Ok(value)
+        }
+        ("GET", "/jobs") => serde_json::to_value(app.state::<JobHistoryState>().list())
+            .map_err(|error| error.to_string()),
+        ("GET", path) if path.starts_with("/jobs/") => {
+            let job_id = path.trim_start_matches("/jobs/").trim_end_matches('/');
+            let job = app
+                .state::<JobHistoryState>()
+                .get(job_id)
+                .ok_or_else(|| format!("Unknown job: {job_id}"))?;
+            serde_json::to_value(job).map_err(|error| error.to_string())
         }
         ("GET", "/runtime") => {
             serde_json::to_value(check_runtime(app.clone())?).map_err(|error| error.to_string())
@@ -2060,13 +2322,15 @@ fn set_agent_server_enabled(
     enabled: bool,
     port: Option<u16>,
 ) -> Result<AgentServerStatus, String> {
+    // The webview loads even in headless mode and asks for its saved port on
+    // startup; an explicit CLI/env port must not be overridden by it.
     set_agent_server_enabled_inner(
         app,
         agent_state.inner(),
         persistent_workers.inner(),
         active_jobs.inner(),
         enabled,
-        port,
+        agent_api_cli_port().or(port),
     )
 }
 
@@ -2088,23 +2352,38 @@ fn agent_api_headless_requested() -> bool {
         || env_truthy("DEPTHMAP_AGENT_HEADLESS")
 }
 
+/// Port explicitly requested on the command line (`--agent-api-port`) or via
+/// `DEPTHMAP_AGENT_API_PORT` / `NEKO_AGENT_API_PORT`. An explicit port always
+/// wins over the GUI's saved port and the shared agent-api-registry.json.
 fn agent_api_cli_port() -> Option<u16> {
-    let mut args = env::args().skip(1);
+    parse_agent_api_port(env::args().skip(1), |name| env::var(name).ok())
+}
+
+fn parse_agent_api_port(
+    args: impl IntoIterator<Item = String>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Option<u16> {
+    let parse = |value: &str| value.trim().parse::<u16>().ok().filter(|port| *port > 0);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--agent-api-port" || arg == "--agent-port" {
-            return args.next().and_then(|value| value.parse::<u16>().ok());
+            if let Some(port) = args.next().as_deref().and_then(parse) {
+                return Some(port);
+            }
+            continue;
         }
         if let Some(value) = arg
             .strip_prefix("--agent-api-port=")
             .or_else(|| arg.strip_prefix("--agent-port="))
         {
-            return value.parse::<u16>().ok();
+            if let Some(port) = parse(value) {
+                return Some(port);
+            }
         }
     }
-    env::var("DEPTHMAP_AGENT_API_PORT")
-        .or_else(|_| env::var("NEKO_AGENT_API_PORT"))
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
+    ["DEPTHMAP_AGENT_API_PORT", "NEKO_AGENT_API_PORT"]
+        .iter()
+        .find_map(|name| env_lookup(name).as_deref().and_then(parse))
 }
 
 fn hide_main_window(app: &tauri::App) {
@@ -2172,6 +2451,7 @@ pub fn run() {
         .manage(ActiveJobState::default())
         .manage(PersistentWorkerState::default())
         .manage(AgentServerState::default())
+        .manage(JobHistoryState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -2217,4 +2497,97 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn cli_port_wins_over_env() {
+        let env = |name: &str| (name == "DEPTHMAP_AGENT_API_PORT").then(|| "18001".to_string());
+        assert_eq!(
+            parse_agent_api_port(args(&["--headless", "--agent-api-port", "18000"]), env),
+            Some(18000)
+        );
+        assert_eq!(
+            parse_agent_api_port(args(&["--agent-port=18002"]), env),
+            Some(18002)
+        );
+        assert_eq!(parse_agent_api_port(args(&["--headless"]), env), Some(18001));
+    }
+
+    #[test]
+    fn env_port_order_and_invalid_values() {
+        let env = |name: &str| match name {
+            "DEPTHMAP_AGENT_API_PORT" => Some("nope".to_string()),
+            "NEKO_AGENT_API_PORT" => Some("18003".to_string()),
+            _ => None,
+        };
+        assert_eq!(parse_agent_api_port(args(&["--agent-api-port", "0"]), env), Some(18003));
+        assert_eq!(parse_agent_api_port(args(&[]), |_| None), None);
+    }
+
+    #[test]
+    fn explicit_port_beats_registry() {
+        assert_eq!(validate_agent_api_port(Some(18004)), Ok(18004));
+    }
+
+    #[test]
+    fn job_history_reports_image_failures() {
+        let history = JobHistoryState::default();
+        history.begin("a", "generate", 2);
+        history.record_event(
+            "a",
+            &serde_json::json!({ "type": "image_error", "message": "boom", "path": "/x/bad.png" }),
+        );
+        history.record_event(
+            "a",
+            &serde_json::json!({ "type": "image_done", "output": "/x/good_depth.png", "path": "/x/good.png" }),
+        );
+        assert!(history.record_event("a", &serde_json::json!({ "type": "done", "message": "Batch finished" })));
+        let job = history.get("a").unwrap();
+        assert_eq!(job.status, "completed_with_errors");
+        assert_eq!(job.error.as_deref(), Some("bad.png: boom"));
+        assert_eq!(job.outputs, vec!["/x/good_depth.png".to_string()]);
+
+        history.begin("b", "generate", 1);
+        history.record_event("b", &serde_json::json!({ "type": "image_error", "message": "boom" }));
+        history.record_event("b", &serde_json::json!({ "type": "done" }));
+        assert_eq!(history.get("b").unwrap().status, "failed");
+        assert_eq!(history.latest().unwrap().job_id, "b");
+    }
+
+    #[test]
+    fn job_history_reports_worker_errors_and_silent_exits() {
+        let history = JobHistoryState::default();
+        history.begin("a", "generate", 1);
+        history.record_event("a", &serde_json::json!({ "type": "error", "message": "CUDA out of memory" }));
+        // Already terminal: the exit handler must not overwrite the real error.
+        assert!(history
+            .finish_after_exit("a", false, Err("gone".to_string()), "Depth worker")
+            .is_none());
+        let job = history.get("a").unwrap();
+        assert_eq!(job.status, "failed");
+        assert_eq!(job.error.as_deref(), Some("CUDA out of memory"));
+
+        history.begin("b", "generate", 1);
+        history.record_log("b", "Traceback (most recent call last):");
+        history.record_log("b", "ModuleNotFoundError: No module named 'torch'");
+        let event = history
+            .finish_after_exit("b", false, Err("killed".to_string()), "Depth worker")
+            .unwrap();
+        assert_eq!(event["type"], "error");
+        let job = history.get("b").unwrap();
+        assert_eq!(job.status, "failed");
+        assert!(job.error.unwrap().contains("No module named 'torch'"));
+
+        history.begin("c", "generate", 1);
+        history.finish_after_exit("c", true, Err("killed".to_string()), "Depth worker");
+        assert_eq!(history.get("c").unwrap().status, "canceled");
+    }
 }

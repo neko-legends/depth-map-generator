@@ -415,7 +415,11 @@ def relaunch_in_env(job_path: Path, env_dir: Path, need_depth: bool, daemon: boo
 
     for line in process.stdout:
         print(line, end="", flush=True)
-    return process.wait()
+    returncode = process.wait()
+    if returncode < 0:
+        emit("error", f"Depth worker process was terminated by signal {-returncode}.")
+        return 1
+    return returncode
 
 
 def choose_device(requested: str):
@@ -608,9 +612,15 @@ def save_depth(
     normalized[~finite] = 0.0
 
     if output_format == "png16":
-        image = Image.fromarray((normalized * 65535.0).round().astype(np.uint16), mode="I;16")
+        # Pillow 13 rejects Image.fromarray(..., mode="I;16") and the mode
+        # argument is deprecated since 11.3. Build the 16-bit grayscale image
+        # from explicit little-endian bytes so it works on every Pillow version.
+        values = np.ascontiguousarray((normalized * 65535.0).round(), dtype="<u2")
+        height, width = values.shape[:2]
+        image = Image.frombytes("I;16", (width, height), values.tobytes())
     else:
-        image = Image.fromarray((normalized * 255.0).round().astype(np.uint8), mode="L")
+        values = np.ascontiguousarray((normalized * 255.0).round(), dtype=np.uint8)
+        image = Image.fromarray(values)
     image.save(output_path)
 
 
@@ -909,6 +919,8 @@ def run_job(job: dict[str, Any], cache: ModelCache | None = None) -> None:
         model_cache = cache or ModelCache()
         torch, model = model_cache.load(options, Path(job["model_dir"]), Path(job["env_dir"]))
 
+    succeeded = 0
+    failures: list[str] = []
     for image_path in paths:
         output_path = output_path_for(
             image_path,
@@ -963,10 +975,23 @@ def run_job(job: dict[str, Any], cache: ModelCache | None = None) -> None:
                 path=str(image_path),
                 output="; ".join(outputs),
             )
+            succeeded += 1
         except Exception as error:  # noqa: BLE001 - show per-file failures to the UI.
-            emit("image_error", str(error), path=str(image_path))
+            message = str(error) or type(error).__name__
+            failures.append(f"{image_path.name}: {message}")
+            emit("image_error", message, path=str(image_path))
 
-    emit("done", "Batch finished.")
+    if failures:
+        emit(
+            "done",
+            f"Batch finished: {len(failures)} of {len(paths)} image"
+            f"{'' if len(paths) == 1 else 's'} failed. {failures[0]}",
+            succeeded=succeeded,
+            failed=len(failures),
+            errors=failures,
+        )
+    else:
+        emit("done", "Batch finished.", succeeded=succeeded, failed=0)
 
 
 def daemon_loop() -> int:
@@ -1002,7 +1027,11 @@ def main() -> int:
 
     if os.environ.get("DEPTHMAPAI_VENV_ACTIVE") != "1":
         need_depth = args.daemon or bool(job.get("options", {}).get("generateDepth", True))
-        return relaunch_in_env(job_path, Path(job["env_dir"]), need_depth, args.daemon)
+        try:
+            return relaunch_in_env(job_path, Path(job["env_dir"]), need_depth, args.daemon)
+        except Exception as error:  # noqa: BLE001 - report environment setup failures.
+            emit("error", f"Python environment setup failed: {error}")
+            return 1
 
     try:
         if args.daemon:
