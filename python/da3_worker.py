@@ -166,15 +166,43 @@ def nvidia_smi_available() -> bool:
     return True
 
 
+def python_starts(python_path: Path) -> bool:
+    """True when the interpreter can load its standard library (``--version``
+    alone succeeds even for a venv whose base Python cannot be found)."""
+    try:
+        subprocess.run(
+            [str(python_path), "-c", "import encodings, json"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def create_env(env_dir: Path) -> None:
+    if os.name == "nt":
+        venv.EnvBuilder(with_pip=True).create(env_dir)
+        return
+    # POSIX: build from the resolved interpreter with symlinks. A copied
+    # interpreter reached through a symlink (e.g. uv's ~/.local/bin/python3.12)
+    # looks for its standard library next to the symlink and cannot start.
+    base_python = os.path.realpath(getattr(sys, "_base_executable", sys.executable))
+    subprocess.run([base_python, "-m", "venv", "--symlinks", str(env_dir)], check=True)
+
+
 def ensure_env(env_dir: Path, need_depth: bool) -> Path:
     python_path = venv_python(env_dir)
-    if python_path.exists() and not supported_python_version(python_version(python_path)):
-        emit("setup", "Recreating app Python environment with a supported Python version")
+    if python_path.exists() and (
+        not supported_python_version(python_version(python_path)) or not python_starts(python_path)
+    ):
+        emit("setup", "Recreating app Python environment")
         shutil.rmtree(env_dir, ignore_errors=True)
 
     if not python_path.exists():
         emit("setup", f"Creating Python environment: {env_dir}")
-        venv.EnvBuilder(with_pip=True).create(env_dir)
+        create_env(env_dir)
 
     if not supported_python_version(python_version(python_path)):
         raise RuntimeError(
