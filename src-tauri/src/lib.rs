@@ -456,11 +456,8 @@ fn supported_python_version(version: (u32, u32, u32)) -> bool {
 }
 
 fn python_version(spec: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = spec.split_whitespace();
-    let executable = parts.next()?;
-    let args: Vec<_> = parts.collect();
-    let mut command = Command::new(executable);
-    command.args(args).arg("--version");
+    let mut command = python_spec_command(spec);
+    command.arg("--version");
     hide_command_window(&mut command);
     let output = command.output().ok()?;
     if !output.status.success() {
@@ -494,7 +491,113 @@ fn find_python() -> Option<String> {
             return Some(candidate.to_string());
         }
     }
+
+    // Rolling-release distros (e.g. Arch/Omarchy) often ship only a newer
+    // Python than the ML stack supports, so fall back to a uv-managed one.
+    #[cfg(not(target_os = "windows"))]
+    if let Some(python) = find_uv().and_then(|uv| uv_python(&uv, false)) {
+        return Some(python);
+    }
     None
+}
+
+/// Like `find_python`, but on Linux/macOS asks uv to install a supported
+/// Python when none is available yet. Used right before starting the worker.
+fn ensure_python() -> Result<String, String> {
+    if let Some(python) = find_python() {
+        return Ok(python);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(python) = find_uv().and_then(|uv| uv_python(&uv, true)) {
+            return Ok(python);
+        }
+        Err("Python 3.10, 3.11, or 3.12 was not found on PATH, and uv was not available to \
+             install one. Install uv (https://docs.astral.sh/uv/) or python3.12 and try again."
+            .to_string())
+    }
+    #[cfg(target_os = "windows")]
+    Err("Python 3.10, 3.11, or 3.12 was not found on PATH.".to_string())
+}
+
+/// Python version uv provides when no supported system Python exists.
+#[cfg(not(target_os = "windows"))]
+const UV_PYTHON_VERSION: &str = "3.12";
+
+/// Locate `uv`: PATH first, then the usual install locations, since apps
+/// started from a desktop launcher may not inherit the shell's PATH.
+#[cfg(not(target_os = "windows"))]
+fn find_uv() -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from("uv")];
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".local").join("bin").join("uv"));
+        candidates.push(home.join(".cargo").join("bin").join("uv"));
+        candidates.push(
+            home.join(".local")
+                .join("share")
+                .join("mise")
+                .join("shims")
+                .join("uv"),
+        );
+    }
+    candidates.push(PathBuf::from("/usr/local/bin/uv"));
+    candidates.push(PathBuf::from("/usr/bin/uv"));
+    candidates.into_iter().find(|uv| {
+        Command::new(uv)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+/// Path of a uv-managed (or uv-discovered) Python 3.10-3.12, installing
+/// `UV_PYTHON_VERSION` first when `install` is set.
+#[cfg(not(target_os = "windows"))]
+fn uv_python(uv: &Path, install: bool) -> Option<String> {
+    let find = || -> Option<String> {
+        let output = Command::new(uv)
+            .args(["python", "find", "--no-project", ">=3.10,<3.13"])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!path.is_empty() && python_version(&path).is_some_and(supported_python_version))
+            .then_some(path)
+    };
+    if let Some(path) = find() {
+        return Some(path);
+    }
+    if !install {
+        return None;
+    }
+    let installed = Command::new(uv)
+        .args(["python", "install", UV_PYTHON_VERSION])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if installed {
+        find()
+    } else {
+        None
+    }
+}
+
+/// Build a command from a Python spec: either an interpreter path (which may
+/// contain spaces) or a launcher plus arguments such as `py -3.11`.
+fn python_spec_command(spec: &str) -> Command {
+    if Path::new(spec).is_file() {
+        return Command::new(spec);
+    }
+    let mut parts = spec.split_whitespace();
+    let mut command = Command::new(parts.next().unwrap_or("python"));
+    command.args(parts);
+    command
 }
 
 fn hide_command_window(command: &mut Command) {
@@ -505,12 +608,7 @@ fn hide_command_window(command: &mut Command) {
 }
 
 fn command_from_python_spec(spec: &str) -> Command {
-    let mut parts = spec.split_whitespace();
-    let executable = parts.next().unwrap_or("python");
-    let mut command = Command::new(executable);
-    for arg in parts {
-        command.arg(arg);
-    }
+    let mut command = python_spec_command(spec);
     hide_command_window(&mut command);
     command
 }
@@ -694,8 +792,7 @@ fn persistent_worker(
         return Ok((worker.pid, worker.stdin.clone()));
     }
 
-    let python = find_python()
-        .ok_or_else(|| "Python 3.10, 3.11, or 3.12 was not found on PATH.".to_string())?;
+    let python = ensure_python()?;
     let worker = worker_path(app)?;
     let app_data = app_data_dir(app)?;
     let jobs_dir = app_data.join("jobs");
@@ -1119,8 +1216,7 @@ fn start_depth_job_core(
         return enqueue_persistent_job(app, persistent_workers, active_jobs, paths, options, false);
     }
 
-    let python = find_python()
-        .ok_or_else(|| "Python 3.10, 3.11, or 3.12 was not found on PATH.".to_string())?;
+    let python = ensure_python()?;
     let worker = worker_path(&app)?;
     let app_data = app_data_dir(&app)?;
     let jobs_dir = app_data.join("jobs");
@@ -1248,8 +1344,7 @@ fn download_model(app: AppHandle, model_repo: String) -> Result<String, String> 
     if active_jobs.is_busy()? {
         return Err("Another job is already running.".to_string());
     }
-    let python = find_python()
-        .ok_or_else(|| "Python 3.10, 3.11, or 3.12 was not found on PATH.".to_string())?;
+    let python = ensure_python()?;
     let worker = worker_path(&app)?;
     let app_data = app_data_dir(&app)?;
     let jobs_dir = app_data.join("jobs");

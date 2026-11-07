@@ -148,7 +148,7 @@ npm run release:build
 Expected Windows outputs:
 
 - `release\portable\depth-map-ai-generator.exe`
-- `release\installer\DepthMap AI Generator_26.7.10_x64-setup.exe`
+- `release\installer\DepthMap AI Generator_26.11.7_x64-setup.exe`
 
 `src-tauri\target\release` is Tauri's raw build output. `release\portable` and
 `release\installer` are the published artifact folders that should be used for
