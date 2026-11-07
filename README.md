@@ -52,6 +52,10 @@ in the screenshot. Click any image to view the original asset.
 - NVIDIA VRAM usage display when `nvidia-smi` is available.
 - Orange/black scalable 16:9 UI.
 
+## Linux / Omarchy
+
+Each GitHub release includes a Linux AppImage (`DepthMap.AI.Generator_<version>_amd64.AppImage`) next to the Windows builds. Make it executable (`chmod +x`) and run it, or let [Neko Legends Control Center](https://github.com/neko-legends/neko-legends-control-center) install, update and launch it for you. Tested on Omarchy (Arch Linux + Hyprland, Wayland, NVIDIA). The Python runtime is set up with [`uv`](https://docs.astral.sh/uv/), which Omarchy already includes; models and environments go in `~/NekoLegendsAI` by default; set `NEKO_AI_HOME` to use another location.
+
 ## Agent API
 
 The local Agent API is on by default so AI agents and the Neko Legends Control
